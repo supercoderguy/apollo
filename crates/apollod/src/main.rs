@@ -1,5 +1,6 @@
 mod config;
 mod ipc;
+mod mounts;
 mod reaper;
 mod registry;
 mod supervisor;
@@ -40,6 +41,17 @@ fn main() -> anyhow::Result<()> {
     let socket_path = args
         .socket
         .unwrap_or_else(|| PathBuf::from(apollo_proto::DEFAULT_SOCKET_PATH));
+
+    // Only meaningful on an actual boot; a no-op check when running as an
+    // ordinary process for development (see README.md).
+    if mounts::is_pid1() {
+        mounts::run();
+    } else {
+        eprintln!(
+            "apollod: not PID 1 (pid {}), skipping early filesystem setup",
+            std::process::id()
+        );
+    }
 
     let configs = config::load_units(&args.config_dir)
         .with_context(|| format!("loading unit files from {}", args.config_dir.display()))?;

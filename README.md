@@ -13,10 +13,12 @@ compatibility with systemd `.service` files. Service definitions are TOML.
 The daemon/CLI split — `apollod` (the supervisor) and `apolloctl` (its
 control client) talking over a Unix socket — is in place, developed and
 tested as an ordinary process rather than as PID 1. apollod now also does
-real PID-1-style reaping (see Architecture below), which is a prerequisite
-for actually running it as PID 1 but doesn't itself require being PID 1 to
-test. Mounting `/proc`/`/sys`/`/dev`, getty, and shutdown handling are
-still future work; see [Roadmap](#roadmap).
+real PID-1-style reaping and early filesystem setup (mounts, fstab,
+hostname — see Architecture below); the mounting code only actually runs
+when apollod is PID 1, so it hasn't been exercised against a real kernel
+yet, only built and reviewed — see [Testing safely on a real
+distro](#testing-safely-on-a-real-distro). Getty and shutdown handling
+are still future work; see [Roadmap](#roadmap).
 
 ## Layout
 
@@ -56,6 +58,13 @@ Concretely:
   This reaps *every* child that ends up parented to apollod — not just
   units it started — which is what makes it correct to run as actual
   PID 1, where any orphaned process on the system can be reparented here.
+- **`mounts.rs`** — early-boot filesystem setup: `/proc`, `/sys`,
+  devtmpfs on `/dev`, `/dev/pts`, `/dev/shm`, `/run` (tmpfs), cgroup2 on
+  `/sys/fs/cgroup`, then `mount -a` + `swapon -a` against `/etc/fstab`
+  and setting the hostname from `/etc/hostname`. Gated in `main.rs` on
+  `is_pid1()` (`getpid() == 1`) — a no-op on every dev/test invocation,
+  since none of it makes sense unless apollod actually is the init
+  process for this boot.
 - **`ipc.rs`** — accepts connections on the control socket; each
   connection is one `Request` in, one `Response` out.
 - **`apollo-proto`** — `Request`/`Response`/`UnitInfo` types shared by
@@ -123,7 +132,9 @@ These are expected at this milestone, not bugs:
   setup). Graceful shutdown sequencing hasn't been built yet (Roadmap
   step 5); no handling of `apollod`'s own SIGTERM/SIGINT at all yet. Kill
   test services manually when experimenting.
-- No filesystem mounting yet (Roadmap step 3).
+- Early mounts (`mounts.rs`) are implemented but only ever run when
+  apollod is PID 1, so they've had a code review and a clean build, not a
+  real boot yet — that happens in the Fedora VM, not here.
 - Units are tracked only by the single pid apollod spawned. A unit that
   forks further children (double-forking daemons, in particular) is
   invisible to apollo beyond that first pid — `stop` won't reach them,
@@ -151,13 +162,16 @@ VM) to a usable login prompt and shutting it down cleanly:
    panics unwinding out of a thread, and there's no handling yet of
    apollod's own termination signals (SIGTERM/SIGINT/Ctrl-Alt-Del) — that
    lands with shutdown handling in step 5.
-3. **Early mounts.** `/proc`, `/sys`, devtmpfs on `/dev`, `/dev/pts`,
-   `/dev/shm`, `/run` (tmpfs), and cgroup2 (unified) on
-   `/sys/fs/cgroup` — most modern daemons, including udev, assume the
-   last one is already there. Then `mount -a` + `swapon -a` against
-   `/etc/fstab` (shell out to util-linux's own binaries rather than
-   reimplementing fstab parsing), and set the hostname from
-   `/etc/hostname`.
+3. ~~Early mounts~~ (implemented, unverified against a real kernel) —
+   `/proc`, `/sys`, devtmpfs on `/dev`, `/dev/pts`, `/dev/shm`, `/run`
+   (tmpfs), and cgroup2 (unified) on `/sys/fs/cgroup` — most modern
+   daemons, including udev, assume the last one is already there. Then
+   `mount -a` + `swapon -a` against `/etc/fstab` (shell out to
+   util-linux's own binaries rather than reimplementing fstab parsing),
+   and set the hostname from `/etc/hostname`. A failure on any one step
+   logs and moves on rather than aborting the rest of boot. Gated on
+   `is_pid1()`, so this has only been exercised as a no-op so far — real
+   verification happens booting the Fedora VM (see Testing below).
 4. **Getty**, so booting actually produces a login prompt: a unit
    running `agetty` on `tty1` (and a serial console for headless VM
    testing), `restart = "always"`.
