@@ -90,6 +90,7 @@ fn early_mounts() -> Vec<EarlyMount> {
 /// mounted) is treated as expected, not an error, since it's normal for
 /// e.g. `/dev` to already be a devtmpfs by the time this runs.
 pub fn run() {
+    remount_root_rw();
     ensure_default_path();
 
     for m in early_mounts() {
@@ -124,6 +125,31 @@ fn ensure_default_path() {
         std::env::set_var("PATH", default);
     }
     eprintln!("apollod: no PATH in the environment, defaulting to {default}");
+}
+
+/// The kernel mounts the real root filesystem according to the `ro`/`rw`
+/// boot cmdline flag, and most distros' bootloaders default that to `ro`
+/// (historically so `fsck` could run safely before anything wrote to it).
+/// Remounting it read-write is init's job early in boot — systemd has its
+/// own unit for this, runit does it in stage 1 — and skipping it means
+/// every unit whose working directory, PID file, or logs live on `/` (i.e.
+/// almost all of them) fails as soon as it tries to write anything, even
+/// though the mounts above (which all land on their own tmpfs/devtmpfs)
+/// keep working. Must run before anything else in `run()` touches `/`.
+fn remount_root_rw() {
+    // No fstype/source/data: this modifies the flags of the existing
+    // mount at "/" in place rather than mounting something new over it.
+    let result = mount(
+        None::<&str>,
+        Path::new("/"),
+        None::<&str>,
+        MsFlags::MS_REMOUNT,
+        None::<&str>,
+    );
+    match result {
+        Ok(()) => eprintln!("apollod: remounted / read-write"),
+        Err(e) => eprintln!("apollod: failed to remount / read-write: {e}"),
+    }
 }
 
 fn do_mount(m: &EarlyMount) {

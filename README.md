@@ -75,16 +75,21 @@ Concretely:
   running — it must not exit early just because a shutdown started, since
   `Supervisor::shutdown` depends on it continuing to reap units as they're
   stopped one by one.
-- **`mounts.rs`** — early-boot filesystem setup: first, a default `PATH`
-  if the environment doesn't already have one (PID 1 as exec'd by the
-  kernel typically has *no* environment at all — without this, every
-  bare-name command apollod or any unit shells out to would fail to
-  resolve). Then `/proc`, `/sys`, devtmpfs on `/dev`, `/dev/pts`,
-  `/dev/shm`, `/run` (tmpfs), cgroup2 on `/sys/fs/cgroup`, then `mount -a`
-  + `swapon -a` against `/etc/fstab` and setting the hostname from
-  `/etc/hostname`. Gated in `main.rs` on `is_pid1()` (`getpid() == 1`) —
-  a no-op on every dev/test invocation, since none of it makes sense
-  unless apollod actually is the init process for this boot.
+- **`mounts.rs`** — early-boot filesystem setup: first, remount `/`
+  read-write (the kernel mounts the real root according to the `ro`/`rw`
+  boot cmdline flag, most bootloaders default that to `ro`, and it's
+  init's job to flip it — skip this and every unit that writes anything
+  to a path on `/` fails, even though the tmpfs/devtmpfs mounts below
+  keep working regardless). Then a default `PATH` if the environment
+  doesn't already have one (PID 1 as exec'd by the kernel typically has
+  *no* environment at all — without this, every bare-name command apollod
+  or any unit shells out to would fail to resolve). Then `/proc`, `/sys`,
+  devtmpfs on `/dev`, `/dev/pts`, `/dev/shm`, `/run` (tmpfs), cgroup2 on
+  `/sys/fs/cgroup`, then `mount -a` + `swapon -a` against `/etc/fstab` and
+  setting the hostname from `/etc/hostname`. Gated in `main.rs` on
+  `is_pid1()` (`getpid() == 1`) — a no-op on every dev/test invocation,
+  since none of it makes sense unless apollod actually is the init
+  process for this boot.
 - **`ipc.rs`** — accepts connections on the control socket; each
   connection is one `Request` in, one `Response` out.
 - **`main.rs`** — wires the above together, and is where PID 1's
@@ -212,9 +217,9 @@ These are expected at this milestone, not bugs:
   that plain SIGTERM/SIGINT are handled. Expected (SIGKILL can't be
   caught by anything, ever), but worth remembering when force-killing a
   test instance.
-- Early mounts (`mounts.rs`) are implemented but only ever run when
-  apollod is PID 1, so they've had a code review and a clean build, not a
-  real boot yet — that happens in the Fedora VM, not here.
+- Early mounts (`mounts.rs`) only ever run when apollod is PID 1, so
+  they're unexercised by any dev/test invocation — verification happens
+  on a real boot, e.g. the Void Linux VM (see Roadmap step 3).
 - Units are tracked only by the single pid apollod spawned. A unit that
   forks further children (double-forking daemons, in particular) is
   invisible to apollo beyond that first pid — `stop` won't reach them,
@@ -232,7 +237,22 @@ These are expected at this milestone, not bugs:
 ## Roadmap
 
 Ordered toward the concrete goal of booting a real distro (Fedora, in a
-VM) to a usable login prompt and shutting it down cleanly:
+VM) to a usable login prompt and shutting it down cleanly.
+
+**Tested on:**
+
+- **Void Linux (VM): working.** Boots to a login prompt via the getty
+  units and `apolloctl poweroff`/`reboot` shut it down cleanly — no
+  hung units, no SIGKILL fallback. Found and fixed the read-only-root
+  issue above on this boot. No systemd involved (Void's own init is
+  runit), so this is also a useful cross-check that nothing here
+  accidentally depended on systemd-specific behavior.
+- **Fedora (VM): not yet working.** First boot attempt via the `init=`
+  GRUB edit landed in dracut's own initramfs emergency shell rather than
+  reaching apollod at all — the likely cause under investigation is the
+  `init=` path/binary itself (dracut refuses to `switch_root` to a
+  target that doesn't exist or isn't executable), not necessarily a bug
+  in apollod. Unresolved as of this writing.
 
 1. ~~Daemon/CLI split with a control socket~~ (done)
 2. ~~Real PID 1 reaping~~ (done) — `SIGCHLD` blocked on the main thread
@@ -255,16 +275,18 @@ VM) to a usable login prompt and shutting it down cleanly:
    `panic!()` plus a temporary `is_pid1()` override to actually exercise
    the hang branch without needing to be real PID 1: confirmed apollod
    holds instead of exiting, then reverted both changes.
-3. ~~Early mounts~~ (implemented, unverified against a real kernel) —
-   `/proc`, `/sys`, devtmpfs on `/dev`, `/dev/pts`, `/dev/shm`, `/run`
-   (tmpfs), and cgroup2 (unified) on `/sys/fs/cgroup` — most modern
-   daemons, including udev, assume the last one is already there. Then
-   `mount -a` + `swapon -a` against `/etc/fstab` (shell out to
+3. ~~Early mounts~~ (done, verified on a real boot — Void Linux VM) —
+   remount `/` read-write (the kernel mounts real root according to the
+   `ro`/`rw` boot cmdline flag; most bootloaders default `ro`, and it's
+   init's job to flip it — missing initially, found on the first real
+   boot: units could start but any of them writing to a path on `/`
+   failed silently), then `/proc`, `/sys`, devtmpfs on `/dev`, `/dev/pts`,
+   `/dev/shm`, `/run` (tmpfs), and cgroup2 (unified) on `/sys/fs/cgroup` —
+   most modern daemons, including udev, assume the last one is already
+   there. Then `mount -a` + `swapon -a` against `/etc/fstab` (shell out to
    util-linux's own binaries rather than reimplementing fstab parsing),
    and set the hostname from `/etc/hostname`. A failure on any one step
-   logs and moves on rather than aborting the rest of boot. Gated on
-   `is_pid1()`, so this has only been exercised as a no-op so far — real
-   verification happens booting the Fedora VM (see Testing below).
+   logs and moves on rather than aborting the rest of boot.
 4. ~~Getty~~ (done) — `examples/getty/getty-tty1.toml` and
    `getty-serial.toml`, plain `restart = "always"` units, no dedicated
    code needed. Verified in dev mode: apollod starts both against real
