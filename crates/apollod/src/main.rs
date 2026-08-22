@@ -31,6 +31,12 @@ struct Args {
     /// Path to the Unix control socket apolloctl connects to.
     #[arg(long)]
     socket: Option<PathBuf>,
+
+    /// Directory each unit's stdout/stderr is captured into, one
+    /// `<name>.log` file per unit, instead of inheriting apollod's own
+    /// console (see supervisor.rs::spawn_unit).
+    #[arg(long, default_value = "/var/log/apollo")]
+    log_dir: PathBuf,
 }
 
 fn main() {
@@ -84,7 +90,19 @@ fn boot() -> anyhow::Result<()> {
     let order = config::resolve_start_order(&configs)?;
     eprintln!("apollod: loaded {} unit(s)", configs.len());
 
-    let (mut sup, events_tx) = supervisor::Supervisor::new();
+    // Best-effort: a unit whose log file can't be opened (e.g. this
+    // directory doesn't exist and isn't writable — likely dev/test mode,
+    // see README) just falls back to inheriting apollod's own console for
+    // that one unit, handled per-unit in spawn_unit rather than aborting
+    // boot over it here.
+    if let Err(e) = std::fs::create_dir_all(&args.log_dir) {
+        eprintln!(
+            "apollod: couldn't create log directory {}: {e} (units will log to the console instead)",
+            args.log_dir.display()
+        );
+    }
+
+    let (mut sup, events_tx) = supervisor::Supervisor::new(args.log_dir);
     sup.load(configs);
 
     // As PID 1, apollod is responsible for reaping every child that ends

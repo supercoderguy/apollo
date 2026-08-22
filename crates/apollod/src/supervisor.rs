@@ -16,8 +16,10 @@ use nix::sys::signal::{self, SigSet, Signal};
 use nix::unistd::Pid;
 use std::collections::HashMap;
 use std::fmt;
+use std::fs::{File, OpenOptions};
 use std::os::unix::process::CommandExt;
-use std::process::Command;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -114,12 +116,15 @@ pub struct Supervisor {
     /// The order units were started in at boot, so [`Supervisor::shutdown`]
     /// can stop them in the reverse of it.
     boot_order: Vec<String>,
+    /// Directory each unit's stdout/stderr is captured into — see
+    /// `spawn_unit`.
+    log_dir: PathBuf,
 }
 
 impl Supervisor {
     /// Creates a new supervisor and returns it along with a sender clients
     /// (the IPC server, the reaper thread) can use to post it events.
-    pub fn new() -> (Self, mpsc::Sender<Event>) {
+    pub fn new(log_dir: PathBuf) -> (Self, mpsc::Sender<Event>) {
         let (tx, rx) = mpsc::channel();
         (
             Self {
@@ -127,6 +132,7 @@ impl Supervisor {
                 events_rx: rx,
                 events_tx: tx.clone(),
                 boot_order: Vec::new(),
+                log_dir,
             },
             tx,
         )
@@ -238,7 +244,7 @@ impl Supervisor {
         if matches!(unit.state, UnitState::Running | UnitState::Stopping) {
             return;
         }
-        match spawn_unit(name, &unit.config) {
+        match spawn_unit(name, &unit.config, &self.log_dir) {
             Ok(pid) => {
                 unit.pid = Some(pid);
                 unit.state = UnitState::Running;
@@ -455,13 +461,30 @@ impl Supervisor {
     }
 }
 
+/// Opens (creating if needed, appending if not — so a restart's output
+/// doesn't clobber what came before it) `<log_dir>/<name>.log`, returning
+/// two independent handles to it (via `try_clone`, not opening it twice)
+/// so a unit's stdout and stderr can be wired up as separate `Stdio`s that
+/// still land in the same file and share its write offset — the same
+/// effect as a shell's `2>&1`.
+///
+/// `Err` here isn't fatal to spawning the unit — see the fallback in
+/// `spawn_unit` — so this is `Result` rather than something that panics or
+/// gets unwrapped.
+fn open_unit_log(name: &str, log_dir: &Path) -> std::io::Result<(File, File)> {
+    let path = log_dir.join(format!("{name}.log"));
+    let out = OpenOptions::new().create(true).append(true).open(&path)?;
+    let err = out.try_clone()?;
+    Ok((out, err))
+}
+
 /// Spawns a unit's process and returns its pid. Only the pid is kept in
 /// the registry — no `Child` handle is retained. As PID 1, apollod's
 /// global reaper thread (`reaper.rs`) is what calls `waitpid` on every
 /// child regardless of who spawned it, so there's no per-unit "wait for
 /// exit" thread here anymore; stopping a unit means signalling that pid,
 /// not holding onto a `Child`.
-fn spawn_unit(name: &str, cfg: &UnitConfig) -> anyhow::Result<u32> {
+fn spawn_unit(name: &str, cfg: &UnitConfig, log_dir: &Path) -> anyhow::Result<u32> {
     let (prog, args) = cfg
         .exec
         .split_first()
@@ -474,6 +497,29 @@ fn spawn_unit(name: &str, cfg: &UnitConfig) -> anyhow::Result<u32> {
     }
     if let Some(dir) = &cfg.working_dir {
         cmd.current_dir(dir);
+    }
+
+    // Every unit defaults to inheriting apollod's own stdout/stderr, which
+    // as PID 1 is whatever console the kernel handed it — meaning, without
+    // this, *every* unit's output (plus every restart of it) lands on that
+    // one console forever, indistinguishable from apollod's own log lines
+    // and from whatever a getty/login shell on that same console is trying
+    // to show. Redirect each unit's stdout/stderr into its own log file
+    // instead; fall back to inheriting (the old behavior) only if the log
+    // file itself can't be opened, e.g. `log_dir` doesn't exist and isn't
+    // writable (typical of dev/test mode — see README) — a unit failing to
+    // start over a logging problem alone would be a strange way to fail.
+    match open_unit_log(name, log_dir) {
+        Ok((out, err)) => {
+            cmd.stdout(Stdio::from(out));
+            cmd.stderr(Stdio::from(err));
+        }
+        Err(e) => {
+            eprintln!(
+                "apollod: couldn't open log file for {name} in {}: {e} (its output will go to the console instead)",
+                log_dir.display()
+            );
+        }
     }
 
     // apollod blocks SIGCHLD/SIGTERM/SIGINT on itself for its own

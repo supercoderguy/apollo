@@ -62,8 +62,12 @@ Concretely:
   apollod's own blocked `SIGCHLD`/`SIGTERM`/`SIGINT` into every child, and
   without undoing that, `SIGTERM` (e.g. from `apolloctl stop`) would just
   sit pending against a mask nothing in that process ever unblocks,
-  silently ignored forever. Also owns shutdown: see
-  [Shutdown](#shutdown) below.
+  silently ignored forever. `spawn_unit` also redirects each unit's
+  stdout/stderr to its own `<log-dir>/<name>.log` (default
+  `/var/log/apollo`, `--log-dir` to override) instead of leaving it to
+  inherit apollod's own console — falls back to inheriting (the old
+  behavior) only if that file itself can't be opened. Also owns shutdown:
+  see [Shutdown](#shutdown) below.
 - **`reaper.rs`** — one dedicated thread doing two jobs. Real PID-1-style
   reaping: `SIGCHLD`/`SIGTERM`/`SIGINT` are blocked on the main thread
   before anything else happens (so all later threads, including every
@@ -134,6 +138,10 @@ SOME_VAR = "value"
   immediate) also waits 1s (`RESTART_BACKOFF`) before respawning, so a
   unit that fails instantly on every attempt still takes ~5 real seconds
   to exhaust its 5 attempts rather than doing it in a single burst.
+- Every unit's stdout/stderr goes to its own `/var/log/apollo/<name>.log`
+  (`--log-dir` on apollod to change where), not to whatever console
+  apollod itself inherited — see the `supervisor.rs` bullet under
+  Architecture.
 
 ### Importing services from runit
 
@@ -234,9 +242,12 @@ and just get a warning printed plus a `# NOTE:` comment in the generated
 file, rather than being silently dropped:
 
 - A `log/` subdirectory (a companion log service, piped from the main
-  one by `runsv` itself at the file-descriptor level) — apollo has no
-  log capture yet (Roadmap step 9), so the unit's output just inherits
-  apollod's own console instead.
+  one by `runsv` itself at the file-descriptor level, typically into
+  rotated files via `svlogd`) — apollo has no equivalent log-service
+  concept, so this isn't migrated. The main service's own output still
+  ends up captured, just via apollod's own per-unit
+  `/var/log/apollo/<name>.log` rather than whatever `log/` would have
+  done with it (no rotation, no runit-specific processing).
 - A `finish` script (run by `runsv` on exit, for cleanup) — apollo has
   no equivalent hook; not migrated.
 
@@ -256,13 +267,17 @@ auth (keeping the same pid), and when that session ends the pid exits and
 apollod respawns a fresh `agetty`, same as it would for any other
 long-running unit.
 
-One real, current wrinkle: apollod's own log lines (`eprintln!`) go to
-whatever console it inherited, same as every unit's stdout/stderr right
-now (no log capture yet — Roadmap step 9). If that happens to be the same
-physical console a getty is attached to, apollod's own output can
-interleave with the login prompt. Cosmetic, not a functional problem —
-but it goes away once step 9 gives units (and probably apollod's own
-diagnostics) somewhere else to write.
+One real, current wrinkle: apollod's own log lines (`eprintln!`) still go
+to whatever console it inherited — unlike every *unit's* stdout/stderr,
+which now goes to its own `/var/log/apollo/<name>.log` instead (Roadmap
+step 9, done) precisely so it doesn't collide with a getty/login session
+on that console. apollod's own diagnostics are comparatively low-volume
+(one or two lines per start/stop/restart, not a running service's own
+chatter) and are left on the console deliberately — they're the thing
+worth watching while a boot is still being debugged (see the testing
+walkthrough below). If that turns out to be a problem in practice, giving
+apollod's own diagnostics somewhere else to go too is the natural next
+step.
 
 ### Network
 
@@ -351,20 +366,27 @@ cargo build
 
 ## Running locally (not as PID 1)
 
-`apollod` defaults to `/etc/apollo/services` and
-`/run/apollo/control.sock`, which need root. For local development,
-override both:
+`apollod` defaults to `/etc/apollo/services`, `/run/apollo/control.sock`,
+and `/var/log/apollo`, which need root. For local development, override
+all three:
 
 ```sh
 ./target/debug/apollod \
   --config-dir ./examples/services \
-  --socket /tmp/apollo.sock &
+  --socket /tmp/apollo.sock \
+  --log-dir /tmp/apollo-logs &
 
 ./target/debug/apolloctl --socket /tmp/apollo.sock list
 ./target/debug/apolloctl --socket /tmp/apollo.sock status ping
 ./target/debug/apolloctl --socket /tmp/apollo.sock restart ping
 ./target/debug/apolloctl --socket /tmp/apollo.sock stop ping
 ```
+
+(`--log-dir` isn't strictly required for dev use — a unit whose log file
+can't be opened just falls back to inheriting apollod's own
+stdout/stderr, with a warning — but omitting it means every unit's
+output interleaves on your terminal, which is exactly what `--log-dir`
+exists to avoid.)
 
 `examples/services/` has three units to try this against: `hello` (a
 one-shot), `greeter` (a one-shot that runs `after = ["hello"]`), and
@@ -397,10 +419,6 @@ These are expected at this milestone, not bugs:
   `requires` distinction, no parallelism control beyond what the
   topological order allows (units are currently started serially, in
   order — not fanned out in parallel per dependency level).
-- No log capture — child stdout/stderr currently just inherit apollod's
-  own, as seen in the examples above. For a getty unit specifically, this
-  means apollod's own log lines can visually interleave with the login
-  prompt on the same console (see the Getty section above).
 
 ## Roadmap
 
@@ -494,9 +512,12 @@ VM) to a usable login prompt and shutting it down cleanly.
    against a real boot) — see [Network](#network) below. Also no new
    apollod code — `dbus-daemon --nofork` and `NetworkManager --no-daemon`
    as units, `networkmanager` ordered `after = ["dbus", "udev-trigger"]`.
-9. **Log capture.** Redirect each unit's stdout/stderr to
-   `/var/log/apollo/<name>.log` instead of inheriting apollod's own —
-   needed for debugging boot issues on a console you can't scroll back.
+9. ~~Log capture~~ (done) — each unit's stdout/stderr is redirected to
+   `/var/log/apollo/<name>.log` (`--log-dir` to change the directory)
+   instead of inheriting apollod's own console; falls back to inheriting
+   only if the log file itself can't be opened. apollod's own diagnostic
+   lines (`eprintln!`) still go to the console on purpose — see Getty,
+   above.
 10. Parallel startup within a dependency level.
 
 **Explicitly deferred:** SELinux policy loading. Fedora runs enforcing by
@@ -540,10 +561,14 @@ Steps, for the Fedora VM:
    `enforcing=0` if you didn't set permissive mode already) — then
    `Ctrl-X`/F10 to boot *that edit only*, not save it.
 5. **Watch**: apollod's own log lines and the getty login prompt share
-   the same console right now (see Getty, above) — expect them
-   interleaved, that's cosmetic. Log in, and from that shell,
-   `apolloctl list`/`status` should work against the real default socket
-   (`/run/apollo/control.sock`) with no `--socket` override needed.
+   the same console (see Getty, above) — expect them interleaved, that's
+   cosmetic and deliberate. Unit output itself no longer shows up here at
+   all (Roadmap step 9) — it's in `/var/log/apollo/<name>.log` on the
+   booted system instead, worth checking there if something looks like
+   it started but isn't behaving as expected. Log in, and from that
+   shell, `apolloctl list`/`status` should work against the real default
+   socket (`/run/apollo/control.sock`) with no `--socket` override
+   needed.
    **No networking will be up** on this first boot — deliberately, per
    step 3 above, to keep this first boot's variables down to just
    apollod/getty — so it's console-only; SSH won't reach it. Once this
