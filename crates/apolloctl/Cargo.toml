@@ -1,0 +1,11 @@
+[package]
+name = "apolloctl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Control client for the apollo init daemon"
+
+[dependencies]
+apollo-proto = { path = "../apollo-proto" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }

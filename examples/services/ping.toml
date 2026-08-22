@@ -1,0 +1,4 @@
+# A long-running unit, good for exercising `status` / `stop` / `restart`.
+name = "ping"
+exec = ["/bin/sh", "-c", "while true; do echo ping; sleep 5; done"]
+restart = "always"

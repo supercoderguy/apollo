@@ -1,0 +1,5 @@
+# Demonstrates `after`: apollod starts this only once "hello" has started.
+name = "greeter"
+exec = ["/bin/sh", "-c", "echo greeter running after hello"]
+restart = "no"
+after = ["hello"]

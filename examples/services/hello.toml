@@ -1,0 +1,4 @@
+# A one-shot unit that exits immediately and is not restarted.
+name = "hello"
+exec = ["/bin/sh", "-c", "echo hello from apollo"]
+restart = "no"
