@@ -28,6 +28,12 @@ enum Command {
     Stop { name: String },
     /// Stop and restart a unit.
     Restart { name: String },
+    /// Stop every unit and reboot the machine.
+    Reboot,
+    /// Stop every unit and power the machine off.
+    Poweroff,
+    /// Stop every unit and halt the machine (without powering it off).
+    Halt,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -36,12 +42,26 @@ fn main() -> anyhow::Result<()> {
         .socket
         .unwrap_or_else(|| PathBuf::from(DEFAULT_SOCKET_PATH));
 
+    // Shutdown commands get a more informative success message than the
+    // generic "ok" below, since unlike the other commands the requested
+    // action (stopping every unit, then possibly the whole machine going
+    // down) is still very much in progress when apolloctl gets its reply.
+    let ok_message = match &cli.command {
+        Command::Reboot => "apollod is stopping all units and rebooting",
+        Command::Poweroff => "apollod is stopping all units and powering off",
+        Command::Halt => "apollod is stopping all units and halting",
+        _ => "ok",
+    };
+
     let req = match cli.command {
         Command::List => Request::ListUnits,
         Command::Status { name } => Request::Status { name },
         Command::Start { name } => Request::Start { name },
         Command::Stop { name } => Request::Stop { name },
         Command::Restart { name } => Request::Restart { name },
+        Command::Reboot => Request::Reboot,
+        Command::Poweroff => Request::Poweroff,
+        Command::Halt => Request::Halt,
     };
 
     let mut stream = UnixStream::connect(&socket_path).with_context(|| {
@@ -54,7 +74,7 @@ fn main() -> anyhow::Result<()> {
     let resp: Response = apollo_proto::read_message(&mut stream).context("reading response")?;
 
     match resp {
-        Response::Ok => println!("ok"),
+        Response::Ok => println!("{ok_message}"),
         Response::Error(e) => {
             eprintln!("error: {e}");
             std::process::exit(1);

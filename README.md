@@ -18,8 +18,10 @@ hostname — see Architecture below); the mounting code only actually runs
 when apollod is PID 1, so it hasn't been exercised against a real kernel
 yet, only built and reviewed — see [Testing safely on a real
 distro](#testing-safely-on-a-real-distro). Getty units are in place too
-(`examples/getty/`), so a real boot should reach a login prompt; shutdown
-handling is still future work — see [Roadmap](#roadmap).
+(`examples/getty/`), so a real boot should reach a login prompt, and
+`apolloctl reboot`/`poweroff`/`halt` (plus SIGTERM/SIGINT sent to apollod
+directly) do a full graceful shutdown — see [Shutdown](#shutdown) below.
+See [Roadmap](#roadmap) for what's still ahead.
 
 ## Layout
 
@@ -52,14 +54,27 @@ Concretely:
 - **`supervisor.rs`** — the event loop and all state transitions. Units
   are tracked only by pid; process exits arrive as `Event::ProcessExited`
   from the reaper (below), and `handle_exit` looks up which unit (if any)
-  a pid belongs to.
-- **`reaper.rs`** — real PID-1-style reaping: `SIGCHLD` is blocked on the
-  main thread before anything else happens (so all later threads inherit
-  it blocked), and a dedicated thread synchronously `sigwait()`s for it,
-  draining every ready exit with `waitpid(-1, WNOHANG)` on each wakeup.
+  a pid belongs to. Every spawned unit gets a `pre_exec` hook that resets
+  its inherited (blocked) signal mask before `exec` — `fork()` carries
+  apollod's own blocked `SIGCHLD`/`SIGTERM`/`SIGINT` into every child, and
+  without undoing that, `SIGTERM` (e.g. from `apolloctl stop`) would just
+  sit pending against a mask nothing in that process ever unblocks,
+  silently ignored forever. Also owns shutdown: see
+  [Shutdown](#shutdown) below.
+- **`reaper.rs`** — one dedicated thread doing two jobs. Real PID-1-style
+  reaping: `SIGCHLD`/`SIGTERM`/`SIGINT` are blocked on the main thread
+  before anything else happens (so all later threads, including every
+  spawned unit — see the note on `pre_exec` below — inherit them
+  blocked), and this thread synchronously `sigwait()`s for them, draining
+  every ready exit with `waitpid(-1, WNOHANG)` on each `SIGCHLD` wakeup.
   This reaps *every* child that ends up parented to apollod — not just
   units it started — which is what makes it correct to run as actual
   PID 1, where any orphaned process on the system can be reparented here.
+  The same thread turns `SIGTERM`/`SIGINT` (what the kernel sends PID 1
+  on a plain `kill`/Ctrl-Alt-Del) into an `Event::Shutdown`, then keeps
+  running — it must not exit early just because a shutdown started, since
+  `Supervisor::shutdown` depends on it continuing to reap units as they're
+  stopped one by one.
 - **`mounts.rs`** — early-boot filesystem setup: `/proc`, `/sys`,
   devtmpfs on `/dev`, `/dev/pts`, `/dev/shm`, `/run` (tmpfs), cgroup2 on
   `/sys/fs/cgroup`, then `mount -a` + `swapon -a` against `/etc/fstab`
@@ -116,6 +131,37 @@ interleave with the login prompt. Cosmetic, not a functional problem —
 but it goes away once step 9 gives units (and probably apollod's own
 diagnostics) somewhere else to write.
 
+### Shutdown
+
+`apolloctl reboot`/`poweroff`/`halt` (and SIGTERM/SIGINT sent to apollod
+directly — SIGINT reboots, matching the kernel's Ctrl-Alt-Del-to-PID-1
+convention; SIGTERM powers off) all funnel into one sequence in
+`Supervisor::shutdown`:
+
+1. Reply `Ok` to the caller immediately, *before* doing anything slow —
+   stopping every unit can take seconds, and there's no reason to leave
+   `apolloctl` hanging for it.
+2. Stop every unit in the reverse of its start order, one at a time,
+   waiting for each to actually exit (SIGTERM, then SIGKILL after a 5s
+   timeout) before moving to the next — mirroring dependency order
+   exactly reversed, the same way `after` decided start order.
+3. Only if apollod is actually PID 1: `sync()`, `umount -a -r` against
+   whatever `/etc/fstab` mounted, then `reboot(2)`.
+4. Otherwise (dev/test mode): skip step 3 entirely and just exit. This
+   isn't a testing shortcut bolted on afterward — it's the same
+   `is_pid1()` gate `mounts.rs` uses, because syncing and unmounting the
+   *real* filesystems of whatever machine a dev-testing apollod instance
+   happens to be running on is never correct, regardless of testing
+   concerns.
+
+Verified in dev mode: all three `apolloctl` subcommands, plus SIGTERM and
+SIGINT sent directly to apollod, correctly stop every unit (confirmed via
+the log and process list, not just the reply) and exit — consistently
+within milliseconds when a unit responds to SIGTERM immediately, as all
+the example units do. What's *not* exercised here, and can't be: the
+actual `sync`/`umount`/`reboot(2)` steps, gated behind `is_pid1()` same as
+`mounts.rs` — that's for the Fedora VM.
+
 ## Building
 
 ```sh
@@ -151,13 +197,13 @@ sits blocked waiting for a login, same as `ping` sits in its loop.
 
 These are expected at this milestone, not bugs:
 
-- **Stopping `apollod` does not stop its supervised children.** They're
-  independent processes once spawned; killing the daemon just orphans
-  them (reparented to whatever the system's real PID 1 is, and reaped by
-  *that*, not by apollod — apollod isn't PID 1 yet in this dev-testing
-  setup). Graceful shutdown sequencing hasn't been built yet (Roadmap
-  step 5); no handling of `apollod`'s own SIGTERM/SIGINT at all yet. Kill
-  test services manually when experimenting.
+- **SIGKILL still bypasses everything.** `kill -9 apollod` (or any signal
+  other than SIGTERM/SIGINT) skips the graceful shutdown sequence
+  entirely and just orphans apollod's children — same as the old
+  "stopping apollod doesn't stop its children" caveat, just narrower now
+  that plain SIGTERM/SIGINT are handled. Expected (SIGKILL can't be
+  caught by anything, ever), but worth remembering when force-killing a
+  test instance.
 - Early mounts (`mounts.rs`) are implemented but only ever run when
   apollod is PID 1, so they've had a code review and a clean build, not a
   real boot yet — that happens in the Fedora VM, not here.
@@ -187,9 +233,8 @@ VM) to a usable login prompt and shutting it down cleanly:
    `waitpid(-1, WNOHANG)` (signals don't queue 1:1, so one wakeup can mean
    several exits). Reaps *any* child parented to apollod, known unit or
    not. Still open from this step: apollod doesn't yet guard against
-   panics unwinding out of a thread, and there's no handling yet of
-   apollod's own termination signals (SIGTERM/SIGINT/Ctrl-Alt-Del) — that
-   lands with shutdown handling in step 5.
+   panics unwinding out of a thread. (apollod's own termination signals —
+   SIGTERM/SIGINT/Ctrl-Alt-Del — are now handled; see step 5.)
 3. ~~Early mounts~~ (implemented, unverified against a real kernel) —
    `/proc`, `/sys`, devtmpfs on `/dev`, `/dev/pts`, `/dev/shm`, `/run`
    (tmpfs), and cgroup2 (unified) on `/sys/fs/cgroup` — most modern
@@ -208,12 +253,22 @@ VM) to a usable login prompt and shutting it down cleanly:
    a hard timeout first), and restart/stop behave exactly like any other
    long-running unit. What's *not* verified outside a real boot is the
    actual interactive login flow end-to-end — that's for the Fedora VM.
-5. **`apolloctl reboot` / `poweroff` / `halt`**, with apollod stopping
-   units in reverse dependency order, unmounting, syncing, then calling
-   `reboot(2)` directly. On Fedora, `reboot`/`poweroff`/`halt`/`shutdown`
-   are symlinks to `systemctl`, which needs systemd-PID1's D-Bus socket —
-   none of that exists once apollo is PID 1, so without this there is no
-   clean shutdown path for the VM at all.
+5. ~~`apolloctl reboot` / `poweroff` / `halt`~~ (done) — see
+   [Shutdown](#shutdown) above for the full sequence. On Fedora,
+   `reboot`/`poweroff`/`halt`/`shutdown` are symlinks to `systemctl`,
+   which needs systemd-PID1's D-Bus socket — none of that exists once
+   apollo is PID 1, so without this there would be no clean shutdown path
+   for the VM at all. Also closes out step 2's remaining item: apollod's
+   own SIGTERM/SIGINT are now handled (reaper.rs). Found and fixed two
+   real bugs building this — worth recording since they're the kind of
+   thing that only shows up under actual testing, not code review:
+   forked units silently ignored SIGTERM entirely (they inherit apollod's
+   own blocked signal mask across `fork()`, since `exec()` doesn't reset
+   it — fixed with a `pre_exec` hook), and the reaper thread was
+   `return`ing right after dispatching a signal-triggered shutdown,
+   which meant nothing was left reaping `SIGCHLD` for the rest of the
+   sequence — every unit stopped during that window sat as an unreaped
+   zombie instead of being detected as exited.
 6. **Process-group-based `stop`.** Currently only the immediate pid
    apollo spawned is signalled; anything that double-forks/daemonizes
    escapes tracking entirely. `setsid()` each unit's child and signal its

@@ -7,19 +7,28 @@
 //! `mpsc` channel, so there's no locking anywhere in the core logic.
 
 use crate::config::{RestartPolicy, UnitConfig};
+use crate::mounts;
 use crate::registry::UnitRuntime;
 use anyhow::Context;
 use apollo_proto::{Request, Response, UnitState};
-use nix::sys::signal::{self, Signal};
+use nix::sys::reboot::RebootMode;
+use nix::sys::signal::{self, SigSet, Signal};
 use nix::unistd::Pid;
 use std::collections::HashMap;
+use std::fmt;
+use std::os::unix::process::CommandExt;
 use std::process::Command;
 use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 /// How many times a unit may be auto-restarted (by its restart policy)
 /// before apollod gives up and marks it Failed. Prevents a crash-looping
 /// service from burning CPU forever. Manual `apolloctl restart` is exempt.
 const MAX_RESTARTS: u32 = 5;
+
+/// How long [`Supervisor::shutdown`] waits for a unit to exit after
+/// SIGTERM before giving up and sending SIGKILL.
+const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub enum Event {
     /// A request from an `apolloctl` connection, with a channel to send
@@ -38,11 +47,55 @@ pub enum Event {
         status: String,
         success: bool,
     },
+    /// apollod itself was asked to go down — via SIGTERM/SIGINT
+    /// (`reaper.rs`), not an `apolloctl` connection, so there's no
+    /// `resp_tx` to reply on.
+    Shutdown(ShutdownMode),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ShutdownMode {
+    Reboot,
+    Poweroff,
+    Halt,
+}
+
+impl ShutdownMode {
+    fn reboot_mode(self) -> RebootMode {
+        match self {
+            ShutdownMode::Reboot => RebootMode::RB_AUTOBOOT,
+            ShutdownMode::Poweroff => RebootMode::RB_POWER_OFF,
+            ShutdownMode::Halt => RebootMode::RB_HALT_SYSTEM,
+        }
+    }
+
+    fn from_request(req: &Request) -> Option<Self> {
+        match req {
+            Request::Reboot => Some(ShutdownMode::Reboot),
+            Request::Poweroff => Some(ShutdownMode::Poweroff),
+            Request::Halt => Some(ShutdownMode::Halt),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for ShutdownMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            ShutdownMode::Reboot => "reboot",
+            ShutdownMode::Poweroff => "poweroff",
+            ShutdownMode::Halt => "halt",
+        };
+        f.write_str(s)
+    }
 }
 
 pub struct Supervisor {
     units: HashMap<String, UnitRuntime>,
     events_rx: mpsc::Receiver<Event>,
+    /// The order units were started in at boot, so [`Supervisor::shutdown`]
+    /// can stop them in the reverse of it.
+    boot_order: Vec<String>,
 }
 
 impl Supervisor {
@@ -54,6 +107,7 @@ impl Supervisor {
             Self {
                 units: HashMap::new(),
                 events_rx: rx,
+                boot_order: Vec::new(),
             },
             tx,
         )
@@ -66,25 +120,40 @@ impl Supervisor {
     }
 
     pub fn start_all(&mut self, order: &[String]) {
+        self.boot_order = order.to_vec();
         for name in order {
             self.start_unit(name);
         }
     }
 
     /// Blocks, processing events, until the channel is closed (i.e. every
-    /// sender — including our own retained clone — is dropped).
+    /// sender — including our own retained clone — is dropped) or a
+    /// shutdown is triggered, in which case [`Supervisor::shutdown`] ends
+    /// the process directly and this never returns normally either way.
     pub fn run(mut self) {
         while let Ok(event) = self.events_rx.recv() {
             match event {
-                Event::Command { req, resp_tx } => {
-                    let resp = self.handle_request(req);
-                    let _ = resp_tx.send(resp);
-                }
+                Event::Command { req, resp_tx } => match ShutdownMode::from_request(&req) {
+                    Some(mode) => {
+                        // Reply first: the shutdown sequence can take
+                        // several seconds (stopping every unit), and the
+                        // caller shouldn't be left hanging for it — by the
+                        // time it would matter, the machine is going down
+                        // anyway.
+                        let _ = resp_tx.send(Response::Ok);
+                        self.shutdown(mode); // never returns
+                    }
+                    None => {
+                        let resp = self.handle_request(req);
+                        let _ = resp_tx.send(resp);
+                    }
+                },
                 Event::ProcessExited {
                     pid,
                     status,
                     success,
                 } => self.handle_exit(pid, status, success),
+                Event::Shutdown(mode) => self.shutdown(mode),
             }
         }
     }
@@ -131,6 +200,14 @@ impl Supervisor {
                 }
                 Response::Ok
             }
+            // Intercepted in run()'s match on Event::Command before it
+            // ever calls handle_request, since replying has to happen
+            // before the (possibly multi-second) shutdown sequence, not
+            // after. Reachable only if that dispatch is ever changed to
+            // stop doing so.
+            Request::Reboot | Request::Poweroff | Request::Halt => {
+                Response::Error("internal error: shutdown request reached handle_request".into())
+            }
         }
     }
 
@@ -169,6 +246,104 @@ impl Supervisor {
                 Ok(())
             }
             None => Err(format!("{name} is not running")),
+        }
+    }
+
+    /// Stops every unit (reverse of `boot_order`, waiting for each to
+    /// actually exit before moving to the next — mirroring dependency
+    /// order exactly reversed), then — only if apollod is actually PID 1
+    /// — syncs, unmounts, and calls `reboot(2)`. Never returns: the
+    /// process always ends here, one way or another.
+    ///
+    /// The sync/unmount/reboot(2) steps are skipped entirely when not
+    /// PID 1 (dev/test mode), same gating as `mounts::run` — there's no
+    /// sense in a dev-testing apollod instance syncing and unmounting the
+    /// *real* system it happens to be running on.
+    fn shutdown(&mut self, mode: ShutdownMode) -> ! {
+        eprintln!("apollod: {mode} requested, stopping units...");
+        let order = std::mem::take(&mut self.boot_order);
+        for name in order.iter().rev() {
+            self.stop_and_wait(name, STOP_TIMEOUT);
+        }
+
+        if mounts::is_pid1() {
+            eprintln!("apollod: syncing filesystems");
+            nix::unistd::sync();
+
+            eprintln!("apollod: unmounting filesystems");
+            match Command::new("umount").args(["-a", "-r"]).status() {
+                Ok(status) if status.success() => eprintln!("apollod: umount -a -r succeeded"),
+                Ok(status) => eprintln!("apollod: umount -a -r exited with {status}"),
+                Err(e) => eprintln!("apollod: failed to run umount: {e}"),
+            }
+
+            eprintln!("apollod: calling reboot(2) ({mode})");
+            // reboot(2) only returns on failure — success means the
+            // machine is already going down and never returns to us.
+            let Err(e) = nix::sys::reboot::reboot(mode.reboot_mode());
+            eprintln!("apollod: reboot(2) failed: {e}");
+        } else {
+            eprintln!(
+                "apollod: not PID 1 — skipping sync/unmount/reboot(2) (dev/test mode); exiting instead"
+            );
+        }
+
+        std::process::exit(0);
+    }
+
+    /// Sends SIGTERM to `name` (if running) and blocks — continuing to
+    /// service other events in the meantime, most importantly other
+    /// units' own exits — until it actually exits, or `timeout` passes
+    /// and it's sent SIGKILL instead.
+    fn stop_and_wait(&mut self, name: &str, timeout: Duration) {
+        let Some(pid) = self.units.get(name).and_then(|u| u.pid) else {
+            return; // not running, nothing to do
+        };
+        if let Err(e) = self.stop_unit(name) {
+            eprintln!("apollod: {name}: {e}");
+            return;
+        }
+
+        let mut deadline = Instant::now() + timeout;
+        let mut escalated = false;
+        loop {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                if escalated {
+                    eprintln!(
+                        "apollod: {name} (pid {pid}) still hasn't exited after SIGKILL, giving up"
+                    );
+                    return;
+                }
+                eprintln!(
+                    "apollod: {name} (pid {pid}) didn't stop within {timeout:?}, sending SIGKILL"
+                );
+                let _ = signal::kill(Pid::from_raw(pid as i32), Signal::SIGKILL);
+                escalated = true;
+                deadline = Instant::now() + Duration::from_secs(2);
+                continue;
+            };
+            match self.events_rx.recv_timeout(remaining) {
+                Ok(Event::ProcessExited {
+                    pid: exited_pid,
+                    status,
+                    success,
+                }) => {
+                    let is_this_one = exited_pid == pid;
+                    self.handle_exit(exited_pid, status, success);
+                    if is_this_one {
+                        return;
+                    }
+                    // Some other unit (or an unrelated orphan) exited
+                    // while we were waiting — handled above, keep waiting
+                    // for the one we actually care about.
+                }
+                Ok(Event::Command { resp_tx, .. }) => {
+                    let _ = resp_tx.send(Response::Error("apollod is shutting down".into()));
+                }
+                Ok(Event::Shutdown(_)) => {} // already shutting down, ignore
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                Err(mpsc::RecvTimeoutError::Timeout) => {} // loop, re-check the deadline
+            }
         }
     }
 
@@ -248,6 +423,26 @@ fn spawn_unit(name: &str, cfg: &UnitConfig) -> anyhow::Result<u32> {
     cmd.args(args);
     for (k, v) in &cfg.env {
         cmd.env(k, v);
+    }
+
+    // apollod blocks SIGCHLD/SIGTERM/SIGINT on itself for its own
+    // sigwait()-based handling (reaper.rs) — but fork() carries that
+    // blocked mask into every child, and exec() does *not* reset it.
+    // Without clearing it here first, a spawned unit would silently
+    // ignore SIGTERM (e.g. from `apolloctl stop`) forever, since the
+    // signal just sits pending against a mask nothing in that process
+    // ever unblocks.
+    //
+    // Safety: this closure runs in the forked child, after fork() and
+    // before exec(), when the child is a single-threaded copy of this
+    // process — only async-signal-safe operations are permitted, and
+    // `pthread_sigmask` (what `thread_set_mask` calls) is safe to use
+    // there.
+    unsafe {
+        cmd.pre_exec(|| {
+            SigSet::empty().thread_set_mask()?;
+            Ok(())
+        });
     }
 
     let child = cmd

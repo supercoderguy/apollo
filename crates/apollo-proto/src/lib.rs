@@ -28,6 +28,15 @@ pub enum Request {
     Stop { name: String },
     /// Stop and then restart a unit.
     Restart { name: String },
+    /// Stop every unit (reverse of their start order), then reboot the
+    /// machine. Only actually calls `reboot(2)` if apollod is PID 1 — see
+    /// `supervisor.rs` in apollod.
+    Reboot,
+    /// Like [`Request::Reboot`], but powers the machine off.
+    Poweroff,
+    /// Like [`Request::Reboot`], but halts the machine without powering
+    /// it off.
+    Halt,
 }
 
 /// A response sent from `apollod` back to `apolloctl`.

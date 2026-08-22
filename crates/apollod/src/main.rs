@@ -14,9 +14,12 @@ use std::thread;
 ///
 /// Runnable as PID 1, or as an ordinary process for development (see
 /// README.md — override `--config-dir`/`--socket` since the defaults live
-/// under `/etc/apollo` and `/run`, which need root). See README.md for the
-/// roadmap toward the rest of what a real boot needs (mounts, getty,
-/// shutdown handling, ...).
+/// under `/etc/apollo` and `/run`, which need root). Note for dev/test
+/// use: SIGTERM and SIGINT (so also Ctrl-C) now trigger a graceful
+/// shutdown sequence — stop every unit, then exit — rather than an
+/// immediate kill, matching real PID 1 behavior; see `reaper.rs` and
+/// `supervisor.rs::shutdown`. See README.md for the roadmap toward the
+/// rest of what a real boot needs.
 #[derive(Parser, Debug)]
 #[command(name = "apollod")]
 struct Args {
@@ -35,7 +38,7 @@ fn main() -> anyhow::Result<()> {
     // new threads at creation time, and this closes the window where a
     // fast-exiting child's SIGCHLD could be delivered under the default
     // (ignored) disposition instead of being left pending for the reaper.
-    reaper::block_sigchld().context("blocking SIGCHLD")?;
+    reaper::block_signals().context("blocking signals")?;
 
     let args = Args::parse();
     let socket_path = args
