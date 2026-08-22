@@ -139,13 +139,29 @@ SOME_VAR = "value"
 
 `apollo-import runit <src> <dest>` converts a directory of runit
 services (one subdirectory per service, each with at least an executable
-`run` script — the standard layout under e.g. Void Linux's `/etc/sv/`)
-into apollo `*.toml` units under `<dest>`. `<src>` should be the real,
-final location of the service directories — the generated unit's `exec`
-points straight at each one's `run` script there; nothing is copied.
-`--force` overwrites a unit file that already exists at the destination;
-`--clean` removes *every* existing `*.toml` in `<dest>` first (see
-below for why that's the safer choice for a full re-import).
+`run` script) into apollo `*.toml` units under `<dest>`. `<src>` should
+be the real, final location of the service directories — the generated
+unit's `exec` points straight at each one's `run` script there; nothing
+is copied. `--force` overwrites a unit file that already exists at the
+destination; `--clean` removes *every* existing `*.toml` in `<dest>`
+first (see below for why that's the safer choice for a full re-import).
+
+**On Void specifically, `<src>` should be `/var/service`, not
+`/etc/sv`.** `/etc/sv` is the master copy of *every* service the
+installed packages ship, applicable to this machine or not; `/var/service`
+holds only the ones actually enabled here, as symlinks back into
+`/etc/sv` (that's what `runsvdir` itself watches and starts services
+from). Pointing this tool at `/etc/sv` imports everything Void ships
+regardless of whether it makes sense on this machine — this is the
+*real* fix for the "extra agetty variants and a duplicate time daemon"
+problem described below, not the `down`-file check on its own: most of
+those unwanted services aren't actually marked `down` inside `/etc/sv`
+at all, they're simply never symlinked into `/var/service`, which the
+`down` check has no way to see if it's only ever looking inside
+`/etc/sv`. `/var/service` entries are symlinks rather than plain
+directories, which this tool handles fine — a directory check follows
+symlinks, and the generated `exec`/`working-dir` still resolve to the
+real files either way.
 
 Each generated unit execs the original `run` script directly (no `sh -c`
 wrapper) — the same way `runsv` itself invokes it, relying on the
@@ -164,21 +180,22 @@ exactly as it did under runit. `restart` is always set to `"always"`
 `"on-failure"` — `runsv` restarts a service's `run` script whenever it
 exits, forever, by default).
 
-**Services with a runit `down` file (starts disabled) are skipped by
-default, not converted.** `down` usually marks one of several
-mutually-exclusive alternatives for the same role — e.g. a whole set of
-agetty variants for consoles that may or may not exist on a given
-machine, with only the applicable one(s) enabled — and apollo has no
-"loaded but not started" state to preserve that with, so converting one
-means it auto-starts immediately regardless of whether it's actually
-applicable here. Found on a real boot: importing an entire `/etc/sv/`
-wholesale, `down` files and all, produced over a dozen simultaneously
-crash-looping agetty units (one per possible console type) plus a
-duplicate time-sync daemon fighting an already-running one for the same
-lock file — all from services that were deliberately disabled at the
-source. Pass `--include-down` to convert these anyway if you really want
-them (each still gets a `# NOTE:` comment and a printed warning, same as
-the two items below).
+**Services with a runit `down` file (starts disabled) are also skipped by
+default, not converted** — a secondary safety net on top of pointing
+`<src>` at `/var/service` (above), for the services that *are* enabled
+but still meant to start held down until something else brings them up
+(`sv up`, or a hardware-detection script). apollo has no "loaded but not
+started" state to preserve that with, so converting one means it
+auto-starts immediately regardless. Pass `--include-down` to convert
+these anyway if you really want them (each still gets a `# NOTE:`
+comment and a printed warning, same as the two items below).
+
+Found on a real boot, from both problems at once: importing all of
+`/etc/sv/` wholesale (instead of `/var/service`) produced over a dozen
+simultaneously crash-looping agetty units — one per console type Void
+ships an `agetty-*` service for, whether or not that console actually
+exists on this machine — plus a duplicate time-sync daemon fighting an
+already-running one for the same lock file.
 
 **A re-import doesn't remove anything on its own — use `--clean` for a
 full re-import, or old generated units linger.** Found the hard way:
