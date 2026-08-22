@@ -557,7 +557,7 @@ Steps, for the Fedora VM:
 ## Tested On
 | Distro     | Tester             | Status                       |
 |------------|--------------------|------------------------------|
-| Void Linux | Linux User Lucario | Cannot import runit services |
+| Void Linux | Linux User Lucario | Network devices not working  |
 | Fedora     | Linux User Lucario | Does not boot                |
 
 ## License
