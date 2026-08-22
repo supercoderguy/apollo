@@ -75,15 +75,23 @@ Concretely:
   running — it must not exit early just because a shutdown started, since
   `Supervisor::shutdown` depends on it continuing to reap units as they're
   stopped one by one.
-- **`mounts.rs`** — early-boot filesystem setup: `/proc`, `/sys`,
-  devtmpfs on `/dev`, `/dev/pts`, `/dev/shm`, `/run` (tmpfs), cgroup2 on
-  `/sys/fs/cgroup`, then `mount -a` + `swapon -a` against `/etc/fstab`
-  and setting the hostname from `/etc/hostname`. Gated in `main.rs` on
-  `is_pid1()` (`getpid() == 1`) — a no-op on every dev/test invocation,
-  since none of it makes sense unless apollod actually is the init
-  process for this boot.
+- **`mounts.rs`** — early-boot filesystem setup: first, a default `PATH`
+  if the environment doesn't already have one (PID 1 as exec'd by the
+  kernel typically has *no* environment at all — without this, every
+  bare-name command apollod or any unit shells out to would fail to
+  resolve). Then `/proc`, `/sys`, devtmpfs on `/dev`, `/dev/pts`,
+  `/dev/shm`, `/run` (tmpfs), cgroup2 on `/sys/fs/cgroup`, then `mount -a`
+  + `swapon -a` against `/etc/fstab` and setting the hostname from
+  `/etc/hostname`. Gated in `main.rs` on `is_pid1()` (`getpid() == 1`) —
+  a no-op on every dev/test invocation, since none of it makes sense
+  unless apollod actually is the init process for this boot.
 - **`ipc.rs`** — accepts connections on the control socket; each
   connection is one `Request` in, one `Response` out.
+- **`main.rs`** — wires the above together, and is where PID 1's
+  never-exit constraint is actually enforced: `boot()` (the real startup
+  sequence) runs inside `catch_unwind`, and both a panic and a normal
+  setup `Err` funnel into `fatal()`, which holds the process open instead
+  of exiting when running as PID 1 (see Roadmap step 2).
 - **`apollo-proto`** — `Request`/`Response`/`UnitInfo` types shared by
   `apollod` and `apolloctl`, plus length-prefixed JSON framing
   (`write_message`/`read_message`) over the socket.
@@ -232,9 +240,21 @@ VM) to a usable login prompt and shutting it down cleanly:
    `sigwait()`s on it, and each wakeup drains every ready exit with
    `waitpid(-1, WNOHANG)` (signals don't queue 1:1, so one wakeup can mean
    several exits). Reaps *any* child parented to apollod, known unit or
-   not. Still open from this step: apollod doesn't yet guard against
-   panics unwinding out of a thread. (apollod's own termination signals —
-   SIGTERM/SIGINT/Ctrl-Alt-Del — are now handled; see step 5.)
+   not. (apollod's own termination signals — SIGTERM/SIGINT/Ctrl-Alt-Del —
+   are now handled too; see step 5.) A main-thread panic or setup error is
+   now also caught rather than allowed to exit the process — see
+   `main.rs::fatal` — since PID 1 exiting panics the *kernel*, not just
+   apollod: `main()` wraps `boot()` in `catch_unwind`, and both a panic
+   and a normal early-setup `Err` funnel into the same fallback, which
+   parks the main thread forever instead of exiting when PID 1 (still
+   needs a reset to recover, but that's the same recovery model already
+   in use for this whole testing phase — see below — not a new risk this
+   adds). In dev/test mode this is invisible: exits normally, same as
+   before. Verified in dev mode for both the `Err` path (bad
+   `--config-dir`: exits 1, doesn't hang) and, with a temporary forced
+   `panic!()` plus a temporary `is_pid1()` override to actually exercise
+   the hang branch without needing to be real PID 1: confirmed apollod
+   holds instead of exiting, then reverted both changes.
 3. ~~Early mounts~~ (implemented, unverified against a real kernel) —
    `/proc`, `/sys`, devtmpfs on `/dev`, `/dev/pts`, `/dev/shm`, `/run`
    (tmpfs), and cgroup2 (unified) on `/sys/fs/cgroup` — most modern
@@ -300,7 +320,45 @@ Don't replace `/sbin/init`. Test via a one-time GRUB edit adding
 `init=/path/to/apollod` to the kernel command line — that boots apollo
 for that session only, and a normal reboot goes back to systemd. This is
 the standard way alt-init projects (runit, OpenRC, etc.) get tested: a
-bug that hangs boot just means resetting the VM, not reinstalling it.
+bug that hangs boot just means resetting the VM, not reinstalling it —
+whether the hang is the fail-safe above holding on purpose, or an actual
+kernel panic from something SIGKILL bypassed, the recovery is the same
+either way.
+
+Steps, for the Fedora VM:
+
+1. **Build on the VM itself**, not by copying a binary built elsewhere —
+   a binary linked against this dev machine's glibc isn't guaranteed to
+   run against Fedora's. `git clone`/copy the repo in, install Rust
+   (`rustup` or `dnf install cargo`), `cargo build --release`.
+2. **SELinux**: boot Fedora normally first and either set
+   `/etc/selinux/config` to `permissive`, or plan to add `enforcing=0` on
+   the kernel cmdline in step 4 — SELinux policy loading isn't
+   implemented (see Explicitly deferred, above) and enforcing mode will
+   just get in the way of evaluating apollo itself.
+3. **Install unit files**: `sudo mkdir -p /etc/apollo/services` and copy
+   in `examples/getty/getty-tty1.toml` (graphical/framebuffer console —
+   e.g. virt-manager's default "Console" view) and/or `getty-serial.toml`
+   (serial console — e.g. QEMU `-serial mon:stdio`, or virt-manager with
+   a serial device added and set to a text console). Either or both;
+   whichever matches how you'll actually be watching the VM. Start with
+   *just* these — no other services — to keep the first boot's variables
+   down to apollod itself.
+4. **Boot**: at the GRUB menu, press `e` on the normal boot entry, find
+   the line starting `linux`, and append `init=/path/to/apollod` (and
+   `enforcing=0` if you didn't set permissive mode already) — then
+   `Ctrl-X`/F10 to boot *that edit only*, not save it.
+5. **Watch**: apollod's own log lines and the getty login prompt share
+   the same console right now (see Getty, above) — expect them
+   interleaved, that's cosmetic. Log in, and from that shell,
+   `apolloctl list`/`status` should work against the real default socket
+   (`/run/apollo/control.sock`) with no `--socket` override needed.
+   **No networking will be up** (no dbus/NetworkManager units yet — step
+   8), so this is console-only; SSH won't reach it.
+6. **Shut down**: `apolloctl poweroff` (or `reboot`, or `halt`) from that
+   shell. A `reboot` is safe to try without complication — the GRUB edit
+   from step 4 was one-time, so the *next* boot goes back to systemd
+   automatically, not back into apollo.
 
 ## License
 

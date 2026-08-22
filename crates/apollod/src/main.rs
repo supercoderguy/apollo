@@ -7,6 +7,7 @@ mod supervisor;
 
 use anyhow::Context;
 use clap::Parser;
+use std::panic;
 use std::path::PathBuf;
 use std::thread;
 
@@ -32,14 +33,36 @@ struct Args {
     socket: Option<PathBuf>,
 }
 
-fn main() -> anyhow::Result<()> {
-    // Must happen before any other thread is spawned (including, below,
-    // before any unit process is started): signal masks are inherited by
-    // new threads at creation time, and this closes the window where a
-    // fast-exiting child's SIGCHLD could be delivered under the default
-    // (ignored) disposition instead of being left pending for the reaper.
-    reaper::block_signals().context("blocking signals")?;
+fn main() {
+    // Must happen before any other thread is spawned (including, inside
+    // boot(), before any unit process is started): signal masks are
+    // inherited by new threads at creation time, and this closes the
+    // window where a fast-exiting child's SIGCHLD could be delivered
+    // under the default (ignored) disposition instead of being left
+    // pending for the reaper.
+    if let Err(e) = reaper::block_signals() {
+        fatal(e.context("blocking signals"));
+    }
 
+    // catch_unwind, not a plain call: as PID 1, this process must never
+    // exit — for a panic anywhere during boot() any more than for a
+    // normal setup error — without going through the deliberate,
+    // controlled fallback in `fatal` below.
+    match panic::catch_unwind(boot) {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => fatal(e),
+        Err(_) => fatal(anyhow::anyhow!(
+            "apollod panicked (see the panic message above, if any)"
+        )),
+    }
+}
+
+/// The actual startup sequence. Returns only on a setup failure, before
+/// `sup.run()` — once that starts, the process only ever ends via
+/// `Supervisor::shutdown`'s `std::process::exit`, which terminates
+/// directly rather than unwinding back through this function, so under
+/// normal operation this call simply never returns.
+fn boot() -> anyhow::Result<()> {
     let args = Args::parse();
     let socket_path = args
         .socket
@@ -82,4 +105,30 @@ fn main() -> anyhow::Result<()> {
 
     sup.run();
     Ok(())
+}
+
+/// A setup failure or panic that would otherwise take the whole process
+/// down. As PID 1, that panics the *kernel* ("Attempted to kill init!"),
+/// not just apollod — so instead of exiting, this parks the main thread
+/// forever, holding PID 1 open. Whatever units had already started keep
+/// running unsupervised (the reaper thread, on its own and unaffected by
+/// a main-thread panic, keeps reaping them, so they don't zombie);
+/// recovering from this still needs a reset, same as any other boot
+/// failure in this project's tested workflow, but at least it surfaces as
+/// a hang with a message on the console rather than a kernel panic.
+///
+/// In dev/test mode (not PID 1), none of that constraint applies — just
+/// exit normally, as any CLI tool would.
+fn fatal(e: anyhow::Error) -> ! {
+    eprintln!("apollod: fatal error: {e:#}");
+    if mounts::is_pid1() {
+        eprintln!(
+            "apollod: PID 1 must never exit — holding here instead of exiting (needs a reset to recover)"
+        );
+        loop {
+            thread::park();
+        }
+    } else {
+        std::process::exit(1);
+    }
 }

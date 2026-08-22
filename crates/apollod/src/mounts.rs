@@ -90,6 +90,8 @@ fn early_mounts() -> Vec<EarlyMount> {
 /// mounted) is treated as expected, not an error, since it's normal for
 /// e.g. `/dev` to already be a devtmpfs by the time this runs.
 pub fn run() {
+    ensure_default_path();
+
     for m in early_mounts() {
         if let Err(e) = fs::create_dir_all(m.target) {
             eprintln!("apollod: couldn't create mount point {}: {e}", m.target);
@@ -101,6 +103,27 @@ pub fn run() {
     run_command("mount", &["-a"]);
     run_command("swapon", &["-a"]);
     set_hostname();
+}
+
+/// PID 1 as exec'd by the kernel typically has no environment at all — no
+/// `PATH` in particular. Without one, `run_command` below (and `umount`
+/// in `supervisor.rs`'s shutdown sequence) would fail to find `mount`,
+/// `swapon`, `umount` by bare name, and so would any unit whose `exec`
+/// itself runs further commands by bare name, since children inherit
+/// this process's environment. systemd sets a default `PATH` for exactly
+/// this reason; do the same here, first thing, before anything that
+/// might need it runs.
+fn ensure_default_path() {
+    if std::env::var_os("PATH").is_some() {
+        return;
+    }
+    let default = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+    // Safety: single-threaded at this point in startup — run() is called
+    // from main() before any other thread exists.
+    unsafe {
+        std::env::set_var("PATH", default);
+    }
+    eprintln!("apollod: no PATH in the environment, defaulting to {default}");
 }
 
 fn do_mount(m: &EarlyMount) {
