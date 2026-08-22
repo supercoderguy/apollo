@@ -493,10 +493,10 @@ Steps, for the Fedora VM:
    automatically, not back into apollo.
 
 ## Tested On
-| Distro     | Tester             | Status        |
-|------------|--------------------|---------------|
-| Void Linux | Linux User Lucario | WORKING!      |
-| Fedora     | Linux User Lucario | Does not boot |
+| Distro     | Tester             | Status                       |
+|------------|--------------------|------------------------------|
+| Void Linux | Linux User Lucario | Cannot import runit services |
+| Fedora     | Linux User Lucario | Does not boot                |
 
 ## License
 
