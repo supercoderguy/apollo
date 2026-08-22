@@ -19,12 +19,24 @@ use std::fmt;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 /// How many times a unit may be auto-restarted (by its restart policy)
 /// before apollod gives up and marks it Failed. Prevents a crash-looping
 /// service from burning CPU forever. Manual `apolloctl restart` is exempt.
 const MAX_RESTARTS: u32 = 5;
+
+/// Minimum delay between a unit exiting and an auto-restart of it (policy-
+/// driven, not a manual `apolloctl restart` — that stays immediate).
+/// Without this, a unit that fails instantly on every attempt (a typo'd
+/// path, a device that doesn't exist, a port/lockfile already held by
+/// something else) burns through all `MAX_RESTARTS` attempts in one tight
+/// burst — no real safety issue, MAX_RESTARTS still bounds it, but it's a
+/// flood of forked processes and log lines in well under a second. Found
+/// on a real boot: several imported units crash-looping simultaneously
+/// scrolled the console faster than it could be read.
+const RESTART_BACKOFF: Duration = Duration::from_secs(1);
 
 /// How long [`Supervisor::shutdown`] waits for a unit to exit after
 /// SIGTERM before giving up and sending SIGKILL.
@@ -51,6 +63,9 @@ pub enum Event {
     /// (`reaper.rs`), not an `apolloctl` connection, so there's no
     /// `resp_tx` to reply on.
     Shutdown(ShutdownMode),
+    /// A policy-driven auto-restart's backoff (`RESTART_BACKOFF`) has
+    /// elapsed — see `Supervisor::schedule_restart`.
+    RestartDue(String),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -93,6 +108,9 @@ impl fmt::Display for ShutdownMode {
 pub struct Supervisor {
     units: HashMap<String, UnitRuntime>,
     events_rx: mpsc::Receiver<Event>,
+    /// Kept so [`Supervisor::schedule_restart`] can hand a clone to the
+    /// short-lived backoff thread it spawns.
+    events_tx: mpsc::Sender<Event>,
     /// The order units were started in at boot, so [`Supervisor::shutdown`]
     /// can stop them in the reverse of it.
     boot_order: Vec<String>,
@@ -107,6 +125,7 @@ impl Supervisor {
             Self {
                 units: HashMap::new(),
                 events_rx: rx,
+                events_tx: tx.clone(),
                 boot_order: Vec::new(),
             },
             tx,
@@ -154,6 +173,7 @@ impl Supervisor {
                     success,
                 } => self.handle_exit(pid, status, success),
                 Event::Shutdown(mode) => self.shutdown(mode),
+                Event::RestartDue(name) => self.start_unit(&name),
             }
         }
     }
@@ -341,6 +361,7 @@ impl Supervisor {
                     let _ = resp_tx.send(Response::Error("apollod is shutting down".into()));
                 }
                 Ok(Event::Shutdown(_)) => {} // already shutting down, ignore
+                Ok(Event::RestartDue(_)) => {} // ditto — don't restart into a shutdown
                 Err(mpsc::RecvTimeoutError::Disconnected) => return,
                 Err(mpsc::RecvTimeoutError::Timeout) => {} // loop, re-check the deadline
             }
@@ -357,13 +378,14 @@ impl Supervisor {
         };
 
         let should_restart;
+        let pending_restart;
         {
             let Some(unit) = self.units.get_mut(&name) else {
                 return;
             };
             unit.pid = None;
             unit.exit_status = Some(status.clone());
-            let pending_restart = std::mem::take(&mut unit.pending_restart);
+            pending_restart = std::mem::take(&mut unit.pending_restart);
             let policy_wants_restart = !unit.user_stopped
                 && match unit.config.restart {
                     RestartPolicy::Always => true,
@@ -392,11 +414,37 @@ impl Supervisor {
         }
 
         if should_restart {
-            eprintln!("apollod: {name} exited ({status}), restarting");
-            self.start_unit(&name);
+            if pending_restart {
+                // A manual `apolloctl restart` — keep this immediate, same
+                // as before; only policy-driven (crash-loop) restarts get
+                // backed off.
+                eprintln!("apollod: {name} exited ({status}), restarting");
+                self.start_unit(&name);
+            } else {
+                eprintln!(
+                    "apollod: {name} exited ({status}), restarting in {RESTART_BACKOFF:?}"
+                );
+                self.schedule_restart(&name);
+            }
         } else {
             eprintln!("apollod: {name} exited ({status})");
         }
+    }
+
+    /// Respawns `name` after `RESTART_BACKOFF`, via a short-lived thread
+    /// that sleeps then posts `Event::RestartDue` back onto the event
+    /// channel — not a blocking sleep here in the event loop itself, which
+    /// would stall every other unit and all IPC for the duration.
+    /// `start_unit`'s own Running/Stopping guard makes this safe to act on
+    /// even if something else (a manual `apolloctl start`/`stop`) already
+    /// changed the unit's state by the time it lands.
+    fn schedule_restart(&self, name: &str) {
+        let tx = self.events_tx.clone();
+        let name = name.to_string();
+        thread::spawn(move || {
+            thread::sleep(RESTART_BACKOFF);
+            let _ = tx.send(Event::RestartDue(name));
+        });
     }
 
     fn find_unit_by_pid(&self, pid: u32) -> Option<String> {

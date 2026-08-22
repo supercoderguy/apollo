@@ -28,7 +28,10 @@ pub struct Summary {
 /// unit file under `dest` (created if missing). `src` should be the
 /// real, final location of the service directories — the generated units
 /// point straight at each one's `run` script there; nothing is copied.
-pub fn convert(src: &Path, dest: &Path, force: bool) -> Result<Summary> {
+///
+/// A service with a `down` file is skipped by default rather than
+/// converted — see [`convert_one`] for why — unless `include_down` is set.
+pub fn convert(src: &Path, dest: &Path, force: bool, include_down: bool) -> Result<Summary> {
     fs::create_dir_all(dest)
         .with_context(|| format!("creating destination directory {}", dest.display()))?;
 
@@ -58,7 +61,8 @@ pub fn convert(src: &Path, dest: &Path, force: bool) -> Result<Summary> {
         };
         let name = name.to_string();
 
-        if let Some(reason) = convert_one(&path, &name, dest, force, &mut summary)? {
+        if let Some(reason) = convert_one(&path, &name, dest, force, include_down, &mut summary)?
+        {
             summary.skipped.push((name, reason));
         } else {
             summary.imported.push(name);
@@ -75,6 +79,7 @@ fn convert_one(
     name: &str,
     dest: &Path,
     force: bool,
+    include_down: bool,
     summary: &mut Summary,
 ) -> Result<Option<String>> {
     let run_path = path.join("run");
@@ -89,6 +94,27 @@ fn convert_one(
         return Ok(Some("'run' file isn't executable".into()));
     }
 
+    // A `down` file means this service starts disabled under runit —
+    // often because it's one of several mutually-exclusive alternatives
+    // for the same role (e.g. several agetty variants for consoles that
+    // may or may not exist on a given machine, or one of two competing
+    // time-sync daemons), left for `sv up` or a hardware-detection script
+    // to enable selectively. apollo has no "loaded but not started"
+    // state, so converting one of these means it auto-starts immediately
+    // and, if it's not actually applicable to this machine, crash-loops
+    // (found on a real boot: over a dozen agetty variants for
+    // nonexistent consoles, plus a duplicate time daemon, all fighting
+    // for the same lock file). Skipped by default for that reason;
+    // --include-down opts back into converting it anyway.
+    let has_down = path.join("down").exists();
+    if has_down && !include_down {
+        return Ok(Some(
+            "has a 'down' file (starts disabled under runit, likely one of several \
+             alternatives — see --include-down) — not imported"
+                .into(),
+        ));
+    }
+
     let dest_file = dest.join(format!("{name}.toml"));
     if dest_file.exists() && !force {
         return Ok(Some(format!(
@@ -101,11 +127,10 @@ fn convert_one(
         .with_context(|| format!("resolving absolute path for {}", run_path.display()))?;
 
     let mut note_bits = Vec::new();
-    if path.join("down").exists() {
+    if has_down {
         note_bits.push(
             "had a 'down' file (started disabled under runit) — apollo has no equivalent \
-             yet, so this unit WILL auto-start; remove the generated unit file if that's \
-             not wanted"
+             yet, so this unit WILL auto-start; converted anyway because of --include-down"
                 .to_string(),
         );
     }

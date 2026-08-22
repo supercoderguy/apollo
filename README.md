@@ -124,7 +124,11 @@ SOME_VAR = "value"
   notion of targets/runlevels yet.
 - Restart attempts are capped at 5 per unit per daemon run (see
   `MAX_RESTARTS` in `supervisor.rs`) to avoid burning CPU on a crash loop.
-  A unit that hits the cap is marked `failed` and left alone.
+  A unit that hits the cap is marked `failed` and left alone. Each
+  policy-driven restart (not a manual `apolloctl restart`, which stays
+  immediate) also waits 1s (`RESTART_BACKOFF`) before respawning, so a
+  unit that fails instantly on every attempt still takes ~5 real seconds
+  to exhaust its 5 attempts rather than doing it in a single burst.
 
 ### Importing services from runit
 
@@ -147,13 +151,26 @@ reimplemented here — it keeps working exactly as it did under runit.
 concept to map to apollo's `"no"`/`"on-failure"` — `runsv` restarts a
 service's `run` script whenever it exits, forever, by default).
 
-Three things about a source service have no apollo equivalent (yet) and
-just get a warning printed plus a `# NOTE:` comment in the generated
+**Services with a runit `down` file (starts disabled) are skipped by
+default, not converted.** `down` usually marks one of several
+mutually-exclusive alternatives for the same role — e.g. a whole set of
+agetty variants for consoles that may or may not exist on a given
+machine, with only the applicable one(s) enabled — and apollo has no
+"loaded but not started" state to preserve that with, so converting one
+means it auto-starts immediately regardless of whether it's actually
+applicable here. Found on a real boot: importing an entire `/etc/sv/`
+wholesale, `down` files and all, produced over a dozen simultaneously
+crash-looping agetty units (one per possible console type) plus a
+duplicate time-sync daemon fighting an already-running one for the same
+lock file — all from services that were deliberately disabled at the
+source. Pass `--include-down` to convert these anyway if you really want
+them (each still gets a `# NOTE:` comment and a printed warning, same as
+the two items below).
+
+Two more things about a source service have no apollo equivalent (yet)
+and just get a warning printed plus a `# NOTE:` comment in the generated
 file, rather than being silently dropped:
 
-- A `down` file (service started disabled under runit) — apollo has no
-  "loaded but not started" state yet, so the generated unit **will**
-  auto-start regardless; remove the file if that's not wanted.
 - A `log/` subdirectory (a companion log service, piped from the main
   one by `runsv` itself at the file-descriptor level) — apollo has no
   log capture yet (Roadmap step 9), so the unit's output just inherits

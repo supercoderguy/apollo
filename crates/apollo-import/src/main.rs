@@ -32,14 +32,29 @@ enum Command {
         /// Overwrite a unit file that already exists at the destination.
         #[arg(long)]
         force: bool,
+
+        /// Also convert services with a runit `down` file (starts
+        /// disabled). Off by default: a `down` file usually marks one of
+        /// several mutually-exclusive alternatives for the same role
+        /// (e.g. several agetty variants for consoles that may not exist
+        /// on this machine), and apollo has no "loaded but not started"
+        /// state — converting one means it auto-starts immediately,
+        /// which crash-loops if it isn't actually applicable here.
+        #[arg(long)]
+        include_down: bool,
     },
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Runit { src, dest, force } => {
-            let summary = runit::convert(&src, &dest, force)?;
+        Command::Runit {
+            src,
+            dest,
+            force,
+            include_down,
+        } => {
+            let summary = runit::convert(&src, &dest, force, include_down)?;
             report(&summary);
         }
     }
