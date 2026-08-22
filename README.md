@@ -17,8 +17,9 @@ real PID-1-style reaping and early filesystem setup (mounts, fstab,
 hostname — see Architecture below); the mounting code only actually runs
 when apollod is PID 1, so it hasn't been exercised against a real kernel
 yet, only built and reviewed — see [Testing safely on a real
-distro](#testing-safely-on-a-real-distro). Getty and shutdown handling
-are still future work; see [Roadmap](#roadmap).
+distro](#testing-safely-on-a-real-distro). Getty units are in place too
+(`examples/getty/`), so a real boot should reach a login prompt; shutdown
+handling is still future work — see [Roadmap](#roadmap).
 
 ## Layout
 
@@ -27,7 +28,8 @@ crates/
   apollo-proto/   shared IPC types and wire protocol (Request/Response, framing)
   apollod/        the supervisor daemon
   apolloctl/      the CLI control client
-examples/services/ sample unit files for local testing
+examples/services/ toy unit files for local dev testing (no root needed)
+examples/getty/    real getty units meant for an actual /etc/apollo/services
 ```
 
 ### Architecture
@@ -93,6 +95,27 @@ SOME_VAR = "value"
   `MAX_RESTARTS` in `supervisor.rs`) to avoid burning CPU on a crash loop.
   A unit that hits the cap is marked `failed` and left alone.
 
+### Getty
+
+`examples/getty/` has two units meant to actually be deployed (copy them
+into `/etc/apollo/services/`, not just used as dev-testing toys):
+`getty-tty1` (a virtual-console login prompt — `agetty ... tty1`) and
+`getty-serial` (a serial-console one, for a headless VM — `agetty -L
+ttyS0 ...`). Both are ordinary `restart = "always"` units; no getty-
+specific code exists in apollod, since the generic restart-on-exit
+mechanism already covers it — `agetty` exec's into `login` on successful
+auth (keeping the same pid), and when that session ends the pid exits and
+apollod respawns a fresh `agetty`, same as it would for any other
+long-running unit.
+
+One real, current wrinkle: apollod's own log lines (`eprintln!`) go to
+whatever console it inherited, same as every unit's stdout/stderr right
+now (no log capture yet — Roadmap step 9). If that happens to be the same
+physical console a getty is attached to, apollod's own output can
+interleave with the login prompt. Cosmetic, not a functional problem —
+but it goes away once step 9 gives units (and probably apollod's own
+diagnostics) somewhere else to write.
+
 ## Building
 
 ```sh
@@ -119,7 +142,10 @@ override both:
 `examples/services/` has three units to try this against: `hello` (a
 one-shot), `greeter` (a one-shot that runs `after = ["hello"]`), and
 `ping` (a `restart = "always"` loop, useful for exercising
-stop/start/restart/status).
+stop/start/restart/status). `examples/getty/` can be pointed at the same
+way (`--config-dir ./examples/getty`) to try the getty units against
+this machine's own `/dev/tty1`/`/dev/ttyS0` — safe to do; `agetty` just
+sits blocked waiting for a login, same as `ping` sits in its loop.
 
 ## Current limitations
 
@@ -145,7 +171,9 @@ These are expected at this milestone, not bugs:
   topological order allows (units are currently started serially, in
   order — not fanned out in parallel per dependency level).
 - No log capture — child stdout/stderr currently just inherit apollod's
-  own, as seen in the examples above.
+  own, as seen in the examples above. For a getty unit specifically, this
+  means apollod's own log lines can visually interleave with the login
+  prompt on the same console (see the Getty section above).
 
 ## Roadmap
 
@@ -172,9 +200,14 @@ VM) to a usable login prompt and shutting it down cleanly:
    logs and moves on rather than aborting the rest of boot. Gated on
    `is_pid1()`, so this has only been exercised as a no-op so far — real
    verification happens booting the Fedora VM (see Testing below).
-4. **Getty**, so booting actually produces a login prompt: a unit
-   running `agetty` on `tty1` (and a serial console for headless VM
-   testing), `restart = "always"`.
+4. ~~Getty~~ (done) — `examples/getty/getty-tty1.toml` and
+   `getty-serial.toml`, plain `restart = "always"` units, no dedicated
+   code needed. Verified in dev mode: apollod starts both against real
+   `/dev/tty1`/`/dev/ttyS0` device nodes, they sit correctly blocked
+   waiting for a login (confirmed `agetty` itself works stand-alone with
+   a hard timeout first), and restart/stop behave exactly like any other
+   long-running unit. What's *not* verified outside a real boot is the
+   actual interactive login flow end-to-end — that's for the Fedora VM.
 5. **`apolloctl reboot` / `poweroff` / `halt`**, with apollod stopping
    units in reverse dependency order, unmounting, syncing, then calling
    `reboot(2)` directly. On Fedora, `reboot`/`poweroff`/`halt`/`shutdown`

@@ -1,0 +1,9 @@
+# Login prompt on the primary virtual console. Needed on any VM/machine
+# with a standard virtual console (tty1) — e.g. a QEMU window with a
+# framebuffer/VGA display, or `virsh console` against a graphical guest.
+#
+# The device node this needs (/dev/tty1) comes from devtmpfs, mounted by
+# apollod's early boot setup (mounts.rs) before any unit is started.
+name = "getty-tty1"
+exec = ["/sbin/agetty", "--noclear", "tty1", "linux"]
+restart = "always"

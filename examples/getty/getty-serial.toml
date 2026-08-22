@@ -1,0 +1,9 @@
+# Login prompt on the first serial port (ttyS0) — the usual console for a
+# headless VM, e.g. QEMU started with `-serial mon:stdio` or a
+# virt-manager guest with a "Serial 1" device set to a text console.
+#
+# `-L` ("local line") skips carrier-detect; without it agetty sits
+# forever waiting for a modem signal a virtual serial port never sends.
+name = "getty-serial"
+exec = ["/sbin/agetty", "-L", "ttyS0", "115200", "vt100"]
+restart = "always"
