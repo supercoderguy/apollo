@@ -22,6 +22,9 @@ pub struct Summary {
     /// (name, note) for services converted but with something runit-side
     /// that has no apollo equivalent yet — worth the user's attention.
     pub notes: Vec<(String, String)>,
+    /// Paths of pre-existing `*.toml` files removed from `dest` up front
+    /// because `clean` was set.
+    pub cleaned: Vec<String>,
 }
 
 /// Converts every service directory directly under `src` into a `*.toml`
@@ -31,7 +34,22 @@ pub struct Summary {
 ///
 /// A service with a `down` file is skipped by default rather than
 /// converted — see [`convert_one`] for why — unless `include_down` is set.
-pub fn convert(src: &Path, dest: &Path, force: bool, include_down: bool) -> Result<Summary> {
+///
+/// If `clean` is set, every existing `*.toml` file directly under `dest`
+/// is removed *before* conversion starts — otherwise a service dropped
+/// from this run (e.g. one now correctly skipped for having a `down`
+/// file that an earlier, less careful import converted anyway) leaves
+/// its old generated unit behind, still there and still auto-starting,
+/// same as any other unit apollod finds in its config directory. `clean`
+/// has no way to tell an apollo-import-generated file apart from one
+/// placed in `dest` by hand — it removes every `*.toml` there.
+pub fn convert(
+    src: &Path,
+    dest: &Path,
+    force: bool,
+    include_down: bool,
+    clean: bool,
+) -> Result<Summary> {
     fs::create_dir_all(dest)
         .with_context(|| format!("creating destination directory {}", dest.display()))?;
 
@@ -39,7 +57,24 @@ pub fn convert(src: &Path, dest: &Path, force: bool, include_down: bool) -> Resu
         imported: Vec::new(),
         skipped: Vec::new(),
         notes: Vec::new(),
+        cleaned: Vec::new(),
     };
+
+    if clean {
+        let mut existing: Vec<_> = fs::read_dir(dest)
+            .with_context(|| format!("reading destination directory {}", dest.display()))?
+            .collect::<std::io::Result<_>>()
+            .with_context(|| format!("reading entries of {}", dest.display()))?;
+        existing.sort_by_key(|e| e.file_name());
+        for entry in existing {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("toml") {
+                fs::remove_file(&path)
+                    .with_context(|| format!("removing {}", path.display()))?;
+                summary.cleaned.push(path.display().to_string());
+            }
+        }
+    }
 
     let mut entries: Vec<_> = fs::read_dir(src)
         .with_context(|| format!("reading runit service directory {}", src.display()))?
@@ -125,6 +160,8 @@ fn convert_one(
 
     let run_abs = std::path::absolute(&run_path)
         .with_context(|| format!("resolving absolute path for {}", run_path.display()))?;
+    let dir_abs = std::path::absolute(path)
+        .with_context(|| format!("resolving absolute path for {}", path.display()))?;
 
     let mut note_bits = Vec::new();
     if has_down {
@@ -173,6 +210,15 @@ fn convert_one(
     // "no"/"on-failure", so "always" is the faithful default here; edit by
     // hand afterward for any service that's actually meant to run once.
     toml.push_str("restart = \"always\"\n");
+    // runsv always chdirs into the service's own directory before running
+    // it, so `run` scripts routinely reference sibling files (`./env`,
+    // `./auto`, ...) by relative path — matching that here is what makes
+    // those keep working under apollo instead of failing to find them
+    // against apollod's own cwd.
+    toml.push_str(&format!(
+        "working-dir = {}\n",
+        toml_string(&dir_abs.display().to_string())
+    ));
 
     fs::write(&dest_file, toml).with_context(|| format!("writing {}", dest_file.display()))?;
 

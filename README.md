@@ -113,6 +113,7 @@ name = "sshd"
 exec = ["/usr/sbin/sshd", "-D"]
 restart = "on-failure"   # "no" (default) | "always" | "on-failure"
 after = ["network.target"]
+working-dir = "/etc/sshd" # optional; unset inherits apollod's own cwd
 
 [env]
 SOME_VAR = "value"
@@ -122,6 +123,10 @@ SOME_VAR = "value"
   yourself (`["/bin/sh", "-c", "..."]`).
 - `after` only orders startup among *other loaded units*; there's no
   notion of targets/runlevels yet.
+- `working-dir` is optional and unset by default. Mainly useful for a
+  command that relies on relative paths — `apollo-import runit` sets it
+  automatically (see below) to match `runsv`'s own chdir-before-exec
+  behavior.
 - Restart attempts are capped at 5 per unit per daemon run (see
   `MAX_RESTARTS` in `supervisor.rs`) to avoid burning CPU on a crash loop.
   A unit that hits the cap is marked `failed` and left alone. Each
@@ -138,18 +143,26 @@ services (one subdirectory per service, each with at least an executable
 into apollo `*.toml` units under `<dest>`. `<src>` should be the real,
 final location of the service directories — the generated unit's `exec`
 points straight at each one's `run` script there; nothing is copied.
-`--force` overwrites a unit file that already exists at the destination.
+`--force` overwrites a unit file that already exists at the destination;
+`--clean` removes *every* existing `*.toml` in `<dest>` first (see
+below for why that's the safer choice for a full re-import).
 
 Each generated unit execs the original `run` script directly (no `sh -c`
 wrapper) — the same way `runsv` itself invokes it, relying on the
-script's own shebang line. That's deliberate, not laziness: `run`
-scripts commonly do their own privilege-dropping/env-loading/redirection
-internally (`chpst`, `envdir`, `setuidgid`, ...), and executing the
-script unchanged means none of that needs to be understood or
-reimplemented here — it keeps working exactly as it did under runit.
-`restart` is always set to `"always"` (runit has no native one-shot
-concept to map to apollo's `"no"`/`"on-failure"` — `runsv` restarts a
-service's `run` script whenever it exits, forever, by default).
+script's own shebang line — with `working-dir` set to the service's own
+directory, again matching `runsv` (it always chdirs there before running
+a service, which is why `run` scripts routinely reference sibling files
+like `./env` or `./auto` by relative path — without this they'd fail to
+find them against apollod's own cwd instead; found on a real boot via
+`wpa_supplicant`'s `run` script failing on `. ./auto`). That's deliberate,
+not laziness: `run` scripts commonly do their own privilege-dropping/
+env-loading/redirection internally (`chpst`, `envdir`, `setuidgid`, ...),
+and executing the script unchanged (same binary, same cwd) means none of
+that needs to be understood or reimplemented here — it keeps working
+exactly as it did under runit. `restart` is always set to `"always"`
+(runit has no native one-shot concept to map to apollo's `"no"`/
+`"on-failure"` — `runsv` restarts a service's `run` script whenever it
+exits, forever, by default).
 
 **Services with a runit `down` file (starts disabled) are skipped by
 default, not converted.** `down` usually marks one of several
@@ -166,6 +179,18 @@ lock file — all from services that were deliberately disabled at the
 source. Pass `--include-down` to convert these anyway if you really want
 them (each still gets a `# NOTE:` comment and a printed warning, same as
 the two items below).
+
+**A re-import doesn't remove anything on its own — use `--clean` for a
+full re-import, or old generated units linger.** Found the hard way:
+re-running the importer after upgrading it to skip `down` files (above)
+correctly stopped *generating* those units, but the ones from an earlier,
+less careful import were still sitting in `<dest>` from before — nothing
+had asked to remove them, so apollod loaded and auto-started them right
+alongside the new, correct set, same crash-loop as if nothing had
+changed. `--clean` deletes every `*.toml` in `<dest>` before converting,
+so a re-import actually reflects the current run — but it can't tell an
+apollo-import-generated file apart from a hand-written one, so don't
+point `<dest>` straight at a directory with both mixed in if using it.
 
 Two more things about a source service have no apollo equivalent (yet)
 and just get a warning printed plus a `# NOTE:` comment in the generated

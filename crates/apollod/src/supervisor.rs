@@ -472,6 +472,9 @@ fn spawn_unit(name: &str, cfg: &UnitConfig) -> anyhow::Result<u32> {
     for (k, v) in &cfg.env {
         cmd.env(k, v);
     }
+    if let Some(dir) = &cfg.working_dir {
+        cmd.current_dir(dir);
+    }
 
     // apollod blocks SIGCHLD/SIGTERM/SIGINT on itself for its own
     // sigwait()-based handling (reaper.rs) — but fork() carries that

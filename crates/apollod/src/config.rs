@@ -3,7 +3,7 @@
 use anyhow::{bail, Context};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -21,6 +21,7 @@ pub enum RestartPolicy {
 /// exec = ["/usr/sbin/sshd", "-D"]
 /// restart = "on-failure"
 /// after = ["network.target"]
+/// working-dir = "/etc/sv/sshd"
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 pub struct UnitConfig {
@@ -32,6 +33,15 @@ pub struct UnitConfig {
     pub after: Vec<String>,
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// Working directory to `chdir` into before `exec`. Unset by default
+    /// (inherits apollod's own cwd, as always) — mainly needed for units
+    /// whose command relies on relative paths, e.g. a runit `run` script
+    /// referencing `./env` or `./auto`: `runsv` always chdirs into the
+    /// service's own directory before running it, apollod doesn't do
+    /// anything like that on its own, so `apollo-import runit` sets this
+    /// explicitly to match.
+    #[serde(default, rename = "working-dir")]
+    pub working_dir: Option<PathBuf>,
 }
 
 /// Load every `*.toml` file in `dir` as a unit definition. Returns units

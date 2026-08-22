@@ -42,6 +42,16 @@ enum Command {
         /// which crash-loops if it isn't actually applicable here.
         #[arg(long)]
         include_down: bool,
+
+        /// Remove every existing `*.toml` file in `dest` before
+        /// converting — use this for a full re-import so a service
+        /// dropped from this run (e.g. now correctly skipped for having
+        /// a `down` file) doesn't leave its old generated unit behind,
+        /// still present and still auto-starting. Removes *any* `.toml`
+        /// there, not just ones this tool generated — don't point `dest`
+        /// at a directory with hand-written units mixed in if using this.
+        #[arg(long)]
+        clean: bool,
     },
 }
 
@@ -53,8 +63,9 @@ fn main() -> Result<()> {
             dest,
             force,
             include_down,
+            clean,
         } => {
-            let summary = runit::convert(&src, &dest, force, include_down)?;
+            let summary = runit::convert(&src, &dest, force, include_down, clean)?;
             report(&summary);
         }
     }
@@ -62,6 +73,9 @@ fn main() -> Result<()> {
 }
 
 fn report(summary: &runit::Summary) {
+    for path in &summary.cleaned {
+        println!("removed (--clean): {path}");
+    }
     for name in &summary.imported {
         println!("imported: {name}");
     }
