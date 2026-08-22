@@ -104,7 +104,77 @@ pub fn convert(
         }
     }
 
+    // runit itself has no service directory for udev coldplug (`udevadm
+    // trigger --action=add && udevadm settle`) — real runit-based distros
+    // run it directly from their stage-1 boot script, before runsvdir
+    // ever starts a single service, so there's nothing under `src` for
+    // this scan to find and convert. Skipping it isn't just cosmetic:
+    // without it, PCI/USB devices never get their driver modules loaded
+    // via udev's own uevent-triggered `modprobe`, so e.g. a network
+    // card's kernel driver may never initialize at all — no interface,
+    // not even under the wrong name. Generate the same companion unit
+    // `examples/network/udev-trigger.toml` exists for, automatically,
+    // whenever something that looks like the udev daemon itself made it
+    // into this import.
+    let udev_daemons: Vec<String> = summary
+        .imported
+        .iter()
+        .filter(|n| looks_like_udev_daemon(n))
+        .cloned()
+        .collect();
+    for udev_name in udev_daemons {
+        if let Some(reason) = write_coldplug_unit(&udev_name, dest, force)? {
+            summary.skipped.push((format!("{udev_name}-coldplug"), reason));
+        } else {
+            summary.imported.push(format!("{udev_name}-coldplug"));
+        }
+    }
+
     Ok(summary)
+}
+
+/// Heuristic: does this imported service name look like the udev/eudev
+/// daemon itself, as opposed to some other unrelated service? Void's own
+/// package names its service `udevd`; matched loosely (case-insensitive
+/// substring) rather than exactly in case another distro's naming
+/// differs slightly.
+fn looks_like_udev_daemon(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower == "udevd" || lower.contains("udev")
+}
+
+/// Writes the `<udev_name>-coldplug` companion unit — see the comment in
+/// [`convert`] for why this exists. Same existence/`force` handling as
+/// [`convert_one`].
+fn write_coldplug_unit(udev_name: &str, dest: &Path, force: bool) -> Result<Option<String>> {
+    let coldplug_name = format!("{udev_name}-coldplug");
+    let dest_file = dest.join(format!("{coldplug_name}.toml"));
+    if dest_file.exists() && !force {
+        return Ok(Some(format!(
+            "{} already exists (use --force to overwrite)",
+            dest_file.display()
+        )));
+    }
+
+    let toml = format!(
+        "# Generated alongside the imported '{udev_name}' service: runit performs udev\n\
+         # coldplug from its own stage-1 boot script, not as an /etc/sv service, so\n\
+         # there was nothing under the source directory for apollo-import to find and\n\
+         # convert here — without this, device driver modules that depend on udev's\n\
+         # own uevent-triggered modprobe (e.g. a NIC's) may never get loaded at all.\n\
+         name = {}\n\
+         # The sleep is a real wart, not a style choice: apollod has no readiness/notify\n\
+         # protocol (unlike systemd's Type=notify for udevd), so `after` only orders\n\
+         # start, not \"actually listening\" — see README.\n\
+         exec = [\"/bin/sh\", \"-c\", \"sleep 1 && udevadm trigger --action=add && udevadm settle\"]\n\
+         restart = \"no\"\n\
+         after = [{}]\n",
+        toml_string(&coldplug_name),
+        toml_string(udev_name),
+    );
+
+    fs::write(&dest_file, toml).with_context(|| format!("writing {}", dest_file.display()))?;
+    Ok(None)
 }
 
 /// Returns `Ok(Some(reason))` if this service was skipped, `Ok(None)` if

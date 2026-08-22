@@ -146,22 +146,26 @@ is copied. `--force` overwrites a unit file that already exists at the
 destination; `--clean` removes *every* existing `*.toml` in `<dest>`
 first (see below for why that's the safer choice for a full re-import).
 
-**On Void specifically, `<src>` should be `/var/service`, not
-`/etc/sv`.** `/etc/sv` is the master copy of *every* service the
-installed packages ship, applicable to this machine or not; `/var/service`
-holds only the ones actually enabled here, as symlinks back into
-`/etc/sv` (that's what `runsvdir` itself watches and starts services
-from). Pointing this tool at `/etc/sv` imports everything Void ships
+**On Void specifically, `<src>` should be the *enabled* services
+directory, not `/etc/sv`.** `/etc/sv` is the master copy of *every*
+service the installed packages ship, applicable to this machine or not;
+what's actually enabled here lives as symlinks back into `/etc/sv` under
+`/var/service` — or, if that turns out to be a dangling symlink (varies
+by install), the directory it's *supposed* to point at,
+`/etc/runit/runsvdir/current` (what the running `runsvdir` process
+itself is actually watching and starting services from — check with
+`ls -la /var/service` first, and fall back to the latter if it's
+broken). Pointing this tool at `/etc/sv` imports everything Void ships
 regardless of whether it makes sense on this machine — this is the
 *real* fix for the "extra agetty variants and a duplicate time daemon"
 problem described below, not the `down`-file check on its own: most of
 those unwanted services aren't actually marked `down` inside `/etc/sv`
-at all, they're simply never symlinked into `/var/service`, which the
-`down` check has no way to see if it's only ever looking inside
-`/etc/sv`. `/var/service` entries are symlinks rather than plain
-directories, which this tool handles fine — a directory check follows
+at all, they're simply never symlinked into the enabled directory, which
+the `down` check has no way to see if it's only ever looking inside
+`/etc/sv`. Entries there are symlinks rather than plain directories,
+which this tool handles fine either way — a directory check follows
 symlinks, and the generated `exec`/`working-dir` still resolve to the
-real files either way.
+real files.
 
 Each generated unit execs the original `run` script directly (no `sh -c`
 wrapper) — the same way `runsv` itself invokes it, relying on the
@@ -208,6 +212,22 @@ changed. `--clean` deletes every `*.toml` in `<dest>` before converting,
 so a re-import actually reflects the current run — but it can't tell an
 apollo-import-generated file apart from a hand-written one, so don't
 point `<dest>` straight at a directory with both mixed in if using it.
+
+**A `<name>-coldplug` unit is generated automatically alongside any
+service that looks like the udev/eudev daemon itself** (matched loosely
+on the name, e.g. Void's `udevd`) — `after = ["<name>"]`, running
+`udevadm trigger --action=add && udevadm settle` once. runit-based
+distros run this from their own stage-1 boot script, not as an `/etc/sv`
+service, so there's nothing under `<src>` for a directory scan to find
+and convert here on its own. Skipping it isn't cosmetic: udev coldplug
+is what triggers driver modules to actually load for already-present
+hardware via its uevent-triggered `modprobe`, so without it a device
+whose module isn't loaded some other way may never initialize at all —
+found on a real boot via a VM's NIC not showing up under any name at
+all, not even the wrong one, because its kernel driver never loaded.
+Same `sleep 1` caveat as `examples/network/udev-trigger.toml` (see
+Network, above): apollod has no readiness/notify protocol, so this is a
+blunt fix for a real race, not a design choice.
 
 Two more things about a source service have no apollo equivalent (yet)
 and just get a warning printed plus a `# NOTE:` comment in the generated
