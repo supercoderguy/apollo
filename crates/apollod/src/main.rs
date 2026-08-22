@@ -1,5 +1,6 @@
 mod config;
 mod ipc;
+mod reaper;
 mod registry;
 mod supervisor;
 
@@ -10,9 +11,11 @@ use std::thread;
 
 /// Apollo init system supervisor daemon.
 ///
-/// Not yet run as PID 1 — this milestone is the daemon/CLI split
-/// (apollod + apolloctl over a control socket). See README.md for the
-/// roadmap toward actually booting a system.
+/// Runnable as PID 1, or as an ordinary process for development (see
+/// README.md — override `--config-dir`/`--socket` since the defaults live
+/// under `/etc/apollo` and `/run`, which need root). See README.md for the
+/// roadmap toward the rest of what a real boot needs (mounts, getty,
+/// shutdown handling, ...).
 #[derive(Parser, Debug)]
 #[command(name = "apollod")]
 struct Args {
@@ -26,6 +29,13 @@ struct Args {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Must happen before any other thread is spawned (including, below,
+    // before any unit process is started): signal masks are inherited by
+    // new threads at creation time, and this closes the window where a
+    // fast-exiting child's SIGCHLD could be delivered under the default
+    // (ignored) disposition instead of being left pending for the reaper.
+    reaper::block_sigchld().context("blocking SIGCHLD")?;
+
     let args = Args::parse();
     let socket_path = args
         .socket
@@ -38,6 +48,12 @@ fn main() -> anyhow::Result<()> {
 
     let (mut sup, events_tx) = supervisor::Supervisor::new();
     sup.load(configs);
+
+    // As PID 1, apollod is responsible for reaping every child that ends
+    // up parented to it, not just the units it starts itself — start this
+    // before start_all() spawns anything.
+    reaper::spawn(events_tx.clone());
+
     sup.start_all(&order);
 
     // The IPC server runs on its own thread; the supervisor's event loop

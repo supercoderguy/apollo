@@ -10,12 +10,13 @@ dependency ordering — not socket activation, cgroup resource control, or a
 built-in logging daemon. It's a clean-slate design; it does not aim for
 compatibility with systemd `.service` files. Service definitions are TOML.
 
-The current milestone is the **daemon/CLI split**: `apollod` (the
-supervisor) and `apolloctl` (its control client) talking over a Unix
-socket, developed and tested as an ordinary process rather than as PID 1.
-Actually booting a system — mounting `/proc`, `/sys`, `/dev`, reaping
-reparented orphans, running as PID 1 itself — is future work; see
-[Roadmap](#roadmap).
+The daemon/CLI split — `apollod` (the supervisor) and `apolloctl` (its
+control client) talking over a Unix socket — is in place, developed and
+tested as an ordinary process rather than as PID 1. apollod now also does
+real PID-1-style reaping (see Architecture below), which is a prerequisite
+for actually running it as PID 1 but doesn't itself require being PID 1 to
+test. Mounting `/proc`/`/sys`/`/dev`, getty, and shutdown handling are
+still future work; see [Roadmap](#roadmap).
 
 ## Layout
 
@@ -32,10 +33,10 @@ examples/services/ sample unit files for local testing
 `apollod` is structured as a single-threaded actor: a `Supervisor` owns a
 `HashMap<String, UnitRuntime>` of all unit state, and it is the *only*
 thing that ever touches that map. Everything else — the control-socket
-listener, per-connection handler threads, and the per-child "wait for exit"
-threads — only ever communicates with it by sending an `Event` over an
-`mpsc` channel and (for commands) waiting on a reply channel. This avoids
-locking in the core logic entirely; see `crates/apollod/src/supervisor.rs`.
+listener, per-connection handler threads, and the reaper thread — only
+ever communicates with it by sending an `Event` over an `mpsc` channel
+and (for commands) waiting on a reply channel. This avoids locking in the
+core logic entirely; see `crates/apollod/src/supervisor.rs`.
 
 Concretely:
 - **`config.rs`** — loads `*.toml` unit files from a directory, and
@@ -44,7 +45,17 @@ Concretely:
   `network.target`) is treated as already satisfied.
 - **`registry.rs`** — `UnitRuntime`, the state kept for one loaded unit
   (parsed config + current state + pid + restart bookkeeping).
-- **`supervisor.rs`** — the event loop and all state transitions.
+- **`supervisor.rs`** — the event loop and all state transitions. Units
+  are tracked only by pid; process exits arrive as `Event::ProcessExited`
+  from the reaper (below), and `handle_exit` looks up which unit (if any)
+  a pid belongs to.
+- **`reaper.rs`** — real PID-1-style reaping: `SIGCHLD` is blocked on the
+  main thread before anything else happens (so all later threads inherit
+  it blocked), and a dedicated thread synchronously `sigwait()`s for it,
+  draining every ready exit with `waitpid(-1, WNOHANG)` on each wakeup.
+  This reaps *every* child that ends up parented to apollod — not just
+  units it started — which is what makes it correct to run as actual
+  PID 1, where any orphaned process on the system can be reparented here.
 - **`ipc.rs`** — accepts connections on the control socket; each
   connection is one `Request` in, one `Response` out.
 - **`apollo-proto`** — `Request`/`Response`/`UnitInfo` types shared by
@@ -107,13 +118,17 @@ These are expected at this milestone, not bugs:
 
 - **Stopping `apollod` does not stop its supervised children.** They're
   independent processes once spawned; killing the daemon just orphans
-  them. Reaping reparented orphans is real-PID-1 behavior that hasn't been
-  built yet (see Roadmap). Kill test services manually when experimenting.
-- No graceful shutdown sequencing (stop units in reverse dependency order)
-  yet — there's no handling of `apollod`'s own SIGTERM/SIGINT at all.
-- No filesystem mounting, no real PID 1 responsibilities (reaping
-  arbitrary reparented children via a SIGCHLD-driven `waitpid` loop,
-  rather than one waiter thread per known child).
+  them (reparented to whatever the system's real PID 1 is, and reaped by
+  *that*, not by apollod — apollod isn't PID 1 yet in this dev-testing
+  setup). Graceful shutdown sequencing hasn't been built yet (Roadmap
+  step 5); no handling of `apollod`'s own SIGTERM/SIGINT at all yet. Kill
+  test services manually when experimenting.
+- No filesystem mounting yet (Roadmap step 3).
+- Units are tracked only by the single pid apollod spawned. A unit that
+  forks further children (double-forking daemons, in particular) is
+  invisible to apollo beyond that first pid — `stop` won't reach them,
+  and their exit doesn't affect the unit's tracked state. Process-group-
+  or cgroup-based tracking (Roadmap step 6) fixes this.
 - `after` is the only dependency relation; no targets, no `wants`/
   `requires` distinction, no parallelism control beyond what the
   topological order allows (units are currently started serially, in
@@ -127,13 +142,15 @@ Ordered toward the concrete goal of booting a real distro (Fedora, in a
 VM) to a usable login prompt and shutting it down cleanly:
 
 1. ~~Daemon/CLI split with a control socket~~ (done)
-2. **Real PID 1 reaping.** Block `SIGCHLD` in all threads; one dedicated
-   thread `sigwait()`s on it and drains `waitpid(-1, WNOHANG)` in a loop
-   (signals don't queue 1:1, so a single wakeup can mean several exits).
-   Pids apollo recognizes as a managed unit report to the supervisor as
-   today; anything else (reparented orphans) is just reaped and dropped.
-   Replaces the current one-thread-per-known-child model. Never exit,
-   never let a panic escape — PID 1 exiting panics the kernel.
+2. ~~Real PID 1 reaping~~ (done) — `SIGCHLD` blocked on the main thread
+   before any other thread or unit process exists, a dedicated thread
+   `sigwait()`s on it, and each wakeup drains every ready exit with
+   `waitpid(-1, WNOHANG)` (signals don't queue 1:1, so one wakeup can mean
+   several exits). Reaps *any* child parented to apollod, known unit or
+   not. Still open from this step: apollod doesn't yet guard against
+   panics unwinding out of a thread, and there's no handling yet of
+   apollod's own termination signals (SIGTERM/SIGINT/Ctrl-Alt-Del) — that
+   lands with shutdown handling in step 5.
 3. **Early mounts.** `/proc`, `/sys`, devtmpfs on `/dev`, `/dev/pts`,
    `/dev/shm`, `/run` (tmpfs), and cgroup2 (unified) on
    `/sys/fs/cgroup` — most modern daemons, including udev, assume the

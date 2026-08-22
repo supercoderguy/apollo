@@ -2,9 +2,9 @@
 //!
 //! All unit state lives in a `HashMap` owned by [`Supervisor::run`] and is
 //! only ever touched from that one thread — an actor, not a shared,
-//! lock-guarded registry. IPC handler threads and per-child waiter threads
-//! talk to it exclusively through [`Event`]s over an `mpsc` channel, so
-//! there's no locking anywhere in the core logic.
+//! lock-guarded registry. IPC handler threads and the global PID-1 reaper
+//! thread (`reaper.rs`) talk to it exclusively through [`Event`]s over an
+//! `mpsc` channel, so there's no locking anywhere in the core logic.
 
 use crate::config::{RestartPolicy, UnitConfig};
 use crate::registry::UnitRuntime;
@@ -15,7 +15,6 @@ use nix::unistd::Pid;
 use std::collections::HashMap;
 use std::process::Command;
 use std::sync::mpsc;
-use std::thread;
 
 /// How many times a unit may be auto-restarted (by its restart policy)
 /// before apollod gives up and marks it Failed. Prevents a crash-looping
@@ -29,9 +28,13 @@ pub enum Event {
         req: Request,
         resp_tx: mpsc::Sender<Response>,
     },
-    /// A previously spawned child exited; reported by its waiter thread.
-    ChildExited {
-        name: String,
+    /// A child process exited and was reaped by the global PID-1 reaper
+    /// (`reaper.rs`). This fires for *every* reaped process, not just
+    /// units apollod started — [`Supervisor::handle_exit`] looks up
+    /// whether `pid` belongs to a known unit and ignores it if not (e.g.
+    /// an orphan reparented from elsewhere on the system).
+    ProcessExited {
+        pid: u32,
         status: String,
         success: bool,
     },
@@ -39,19 +42,17 @@ pub enum Event {
 
 pub struct Supervisor {
     units: HashMap<String, UnitRuntime>,
-    events_tx: mpsc::Sender<Event>,
     events_rx: mpsc::Receiver<Event>,
 }
 
 impl Supervisor {
     /// Creates a new supervisor and returns it along with a sender clients
-    /// (the IPC server, waiter threads) can use to post it events.
+    /// (the IPC server, the reaper thread) can use to post it events.
     pub fn new() -> (Self, mpsc::Sender<Event>) {
         let (tx, rx) = mpsc::channel();
         (
             Self {
                 units: HashMap::new(),
-                events_tx: tx.clone(),
                 events_rx: rx,
             },
             tx,
@@ -79,11 +80,11 @@ impl Supervisor {
                     let resp = self.handle_request(req);
                     let _ = resp_tx.send(resp);
                 }
-                Event::ChildExited {
-                    name,
+                Event::ProcessExited {
+                    pid,
                     status,
                     success,
-                } => self.handle_exit(&name, status, success),
+                } => self.handle_exit(pid, status, success),
             }
         }
     }
@@ -140,7 +141,7 @@ impl Supervisor {
         if matches!(unit.state, UnitState::Running | UnitState::Stopping) {
             return;
         }
-        match spawn_unit(name, &unit.config, &self.events_tx) {
+        match spawn_unit(name, &unit.config) {
             Ok(pid) => {
                 unit.pid = Some(pid);
                 unit.state = UnitState::Running;
@@ -171,10 +172,18 @@ impl Supervisor {
         }
     }
 
-    fn handle_exit(&mut self, name: &str, status: String, success: bool) {
+    /// Handles a reaped process exit. `pid` may not belong to any unit at
+    /// all — the reaper reaps every child reparented to apollod as PID 1,
+    /// not just units it started — in which case this is a no-op: the
+    /// reaper has already done the one thing PID 1 owes it (`waitpid`).
+    fn handle_exit(&mut self, pid: u32, status: String, success: bool) {
+        let Some(name) = self.find_unit_by_pid(pid) else {
+            return;
+        };
+
         let should_restart;
         {
-            let Some(unit) = self.units.get_mut(name) else {
+            let Some(unit) = self.units.get_mut(&name) else {
                 return;
             };
             unit.pid = None;
@@ -209,22 +218,27 @@ impl Supervisor {
 
         if should_restart {
             eprintln!("apollod: {name} exited ({status}), restarting");
-            self.start_unit(name);
+            self.start_unit(&name);
         } else {
             eprintln!("apollod: {name} exited ({status})");
         }
     }
+
+    fn find_unit_by_pid(&self, pid: u32) -> Option<String> {
+        self.units
+            .iter()
+            .find(|(_, u)| u.pid == Some(pid))
+            .map(|(name, _)| name.clone())
+    }
 }
 
-/// Spawns a unit's process and hands the `Child` off to a dedicated waiter
-/// thread that blocks on `wait()` and reports the exit back as an
-/// [`Event::ChildExited`]. Only the pid is kept in the registry; stopping a
-/// unit means signalling that pid, not holding onto the `Child` itself.
-fn spawn_unit(
-    name: &str,
-    cfg: &UnitConfig,
-    events_tx: &mpsc::Sender<Event>,
-) -> anyhow::Result<u32> {
+/// Spawns a unit's process and returns its pid. Only the pid is kept in
+/// the registry — no `Child` handle is retained. As PID 1, apollod's
+/// global reaper thread (`reaper.rs`) is what calls `waitpid` on every
+/// child regardless of who spawned it, so there's no per-unit "wait for
+/// exit" thread here anymore; stopping a unit means signalling that pid,
+/// not holding onto a `Child`.
+fn spawn_unit(name: &str, cfg: &UnitConfig) -> anyhow::Result<u32> {
     let (prog, args) = cfg
         .exec
         .split_first()
@@ -236,24 +250,9 @@ fn spawn_unit(
         cmd.env(k, v);
     }
 
-    let mut child = cmd
+    let child = cmd
         .spawn()
         .with_context(|| format!("spawning unit '{name}' ({prog})"))?;
-    let pid = child.id();
 
-    let name = name.to_string();
-    let tx = events_tx.clone();
-    thread::spawn(move || {
-        let (status, success) = match child.wait() {
-            Ok(status) => (status.to_string(), status.success()),
-            Err(e) => (format!("wait failed: {e}"), false),
-        };
-        let _ = tx.send(Event::ChildExited {
-            name,
-            status,
-            success,
-        });
-    });
-
-    Ok(pid)
+    Ok(child.id())
 }
