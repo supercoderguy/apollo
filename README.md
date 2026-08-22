@@ -304,4 +304,4 @@ bug that hangs boot just means resetting the VM, not reinstalling it.
 
 ## License
 
-MIT
+GNU GPL v3 (see [LICENSE.md](LICENSE.md) for full license)
