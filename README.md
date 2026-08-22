@@ -21,7 +21,8 @@ distro](#testing-safely-on-a-real-distro). Getty units are in place too
 (`examples/getty/`), so a real boot should reach a login prompt, and
 `apolloctl reboot`/`poweroff`/`halt` (plus SIGTERM/SIGINT sent to apollod
 directly) do a full graceful shutdown — see [Shutdown](#shutdown) below.
-See [Roadmap](#roadmap) for what's still ahead.
+See [Roadmap](#roadmap) for what's still ahead. See [Tested On](#tested-on)
+to make sure that Apollo has been tested and works on your distro.
 
 ## Layout
 
@@ -381,6 +382,12 @@ Steps, for the Fedora VM:
    shell. A `reboot` is safe to try without complication — the GRUB edit
    from step 4 was one-time, so the *next* boot goes back to systemd
    automatically, not back into apollo.
+
+## Tested On
+| Distro     | Tester             | Status        |
+|------------|--------------------|---------------|
+| Void Linux | Linux User Lucario | WORKING!      |
+| Fedora     | Linux User Lucario | Does not boot |
 
 ## License
 
