@@ -60,7 +60,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "apollo-proto"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -68,7 +68,7 @@ dependencies = [
 
 [[package]]
 name = "apolloctl"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "apollo-proto",
@@ -77,7 +77,7 @@ dependencies = [
 
 [[package]]
 name = "apollod"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "apollo-proto",
