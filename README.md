@@ -123,14 +123,65 @@ These are expected at this milestone, not bugs:
 
 ## Roadmap
 
-1. ~~Daemon/CLI split with a control socket~~ (this milestone)
-2. Graceful shutdown: SIGTERM to `apollod` stops units in reverse
-   dependency order before exiting.
-3. Real PID 1 behavior: mount essential filesystems, reap arbitrary
-   reparented orphans via `SIGCHLD` + a `waitpid(-1, WNOHANG)` loop
-   instead of one thread per known child, boot to a login shell in a VM.
-4. Parallel startup within a dependency level.
-5. Structured logging / log capture per unit.
+Ordered toward the concrete goal of booting a real distro (Fedora, in a
+VM) to a usable login prompt and shutting it down cleanly:
+
+1. ~~Daemon/CLI split with a control socket~~ (done)
+2. **Real PID 1 reaping.** Block `SIGCHLD` in all threads; one dedicated
+   thread `sigwait()`s on it and drains `waitpid(-1, WNOHANG)` in a loop
+   (signals don't queue 1:1, so a single wakeup can mean several exits).
+   Pids apollo recognizes as a managed unit report to the supervisor as
+   today; anything else (reparented orphans) is just reaped and dropped.
+   Replaces the current one-thread-per-known-child model. Never exit,
+   never let a panic escape — PID 1 exiting panics the kernel.
+3. **Early mounts.** `/proc`, `/sys`, devtmpfs on `/dev`, `/dev/pts`,
+   `/dev/shm`, `/run` (tmpfs), and cgroup2 (unified) on
+   `/sys/fs/cgroup` — most modern daemons, including udev, assume the
+   last one is already there. Then `mount -a` + `swapon -a` against
+   `/etc/fstab` (shell out to util-linux's own binaries rather than
+   reimplementing fstab parsing), and set the hostname from
+   `/etc/hostname`.
+4. **Getty**, so booting actually produces a login prompt: a unit
+   running `agetty` on `tty1` (and a serial console for headless VM
+   testing), `restart = "always"`.
+5. **`apolloctl reboot` / `poweroff` / `halt`**, with apollod stopping
+   units in reverse dependency order, unmounting, syncing, then calling
+   `reboot(2)` directly. On Fedora, `reboot`/`poweroff`/`halt`/`shutdown`
+   are symlinks to `systemctl`, which needs systemd-PID1's D-Bus socket —
+   none of that exists once apollo is PID 1, so without this there is no
+   clean shutdown path for the VM at all.
+6. **Process-group-based `stop`.** Currently only the immediate pid
+   apollo spawned is signalled; anything that double-forks/daemonizes
+   escapes tracking entirely. `setsid()` each unit's child and signal its
+   whole process group (`kill(-pgid, ...)`) instead of just the one pid.
+   A cgroup-per-unit approach (kill via `cgroup.kill`) is the more robust
+   long-term fix and falls out naturally once cgroup2 is mounted (step 3).
+7. **udev.** devtmpfs alone gives raw device nodes but not permissions,
+   persistent `/dev/disk/by-uuid` symlinks, or hotplug handling. Start
+   `systemd-udevd` as a unit (it runs fine under a non-systemd PID 1) and
+   run `udevadm trigger --action=add && udevadm settle` for the initial
+   coldplug.
+8. **D-Bus + NetworkManager**, for a networked (SSH-reachable) VM:
+   units for `dbus-broker` (or `dbus-daemon`) and `NetworkManager`,
+   `after = ["dbus"]`.
+9. **Log capture.** Redirect each unit's stdout/stderr to
+   `/var/log/apollo/<name>.log` instead of inheriting apollod's own —
+   needed for debugging boot issues on a console you can't scroll back.
+10. Parallel startup within a dependency level.
+
+**Explicitly deferred:** SELinux policy loading. Fedora runs enforcing by
+default; getting policy load right at the correct point in early boot
+(before anything creates mislabeled files) is a substantial chunk of work
+on its own. Test with `enforcing=0` on the kernel cmdline (or
+`/etc/selinux/config` set to permissive) rather than blocking on this.
+
+### Testing safely on a real distro
+
+Don't replace `/sbin/init`. Test via a one-time GRUB edit adding
+`init=/path/to/apollod` to the kernel command line — that boots apollo
+for that session only, and a normal reboot goes back to systemd. This is
+the standard way alt-init projects (runit, OpenRC, etc.) get tested: a
+bug that hangs boot just means resetting the VM, not reinstalling it.
 
 ## License
 
