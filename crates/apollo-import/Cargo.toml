@@ -1,0 +1,10 @@
+[package]
+name = "apollo-import"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Converts service definitions from other init systems into apollo unit files"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }

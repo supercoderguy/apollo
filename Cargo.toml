@@ -4,6 +4,7 @@ members = [
     "crates/apollo-proto",
     "crates/apollod",
     "crates/apolloctl",
+    "crates/apollo-import",
 ]
 
 [workspace.package]

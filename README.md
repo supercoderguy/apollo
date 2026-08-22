@@ -31,6 +31,7 @@ crates/
   apollo-proto/   shared IPC types and wire protocol (Request/Response, framing)
   apollod/        the supervisor daemon
   apolloctl/      the CLI control client
+  apollo-import/  offline converter: other init systems' services -> apollo units
 examples/services/ toy unit files for local dev testing (no root needed)
 examples/getty/    real getty units meant for an actual /etc/apollo/services
 examples/network/  real udev/dbus/NetworkManager units, ditto
@@ -124,6 +125,44 @@ SOME_VAR = "value"
 - Restart attempts are capped at 5 per unit per daemon run (see
   `MAX_RESTARTS` in `supervisor.rs`) to avoid burning CPU on a crash loop.
   A unit that hits the cap is marked `failed` and left alone.
+
+### Importing services from runit
+
+`apollo-import runit <src> <dest>` converts a directory of runit
+services (one subdirectory per service, each with at least an executable
+`run` script — the standard layout under e.g. Void Linux's `/etc/sv/`)
+into apollo `*.toml` units under `<dest>`. `<src>` should be the real,
+final location of the service directories — the generated unit's `exec`
+points straight at each one's `run` script there; nothing is copied.
+`--force` overwrites a unit file that already exists at the destination.
+
+Each generated unit execs the original `run` script directly (no `sh -c`
+wrapper) — the same way `runsv` itself invokes it, relying on the
+script's own shebang line. That's deliberate, not laziness: `run`
+scripts commonly do their own privilege-dropping/env-loading/redirection
+internally (`chpst`, `envdir`, `setuidgid`, ...), and executing the
+script unchanged means none of that needs to be understood or
+reimplemented here — it keeps working exactly as it did under runit.
+`restart` is always set to `"always"` (runit has no native one-shot
+concept to map to apollo's `"no"`/`"on-failure"` — `runsv` restarts a
+service's `run` script whenever it exits, forever, by default).
+
+Three things about a source service have no apollo equivalent (yet) and
+just get a warning printed plus a `# NOTE:` comment in the generated
+file, rather than being silently dropped:
+
+- A `down` file (service started disabled under runit) — apollo has no
+  "loaded but not started" state yet, so the generated unit **will**
+  auto-start regardless; remove the file if that's not wanted.
+- A `log/` subdirectory (a companion log service, piped from the main
+  one by `runsv` itself at the file-descriptor level) — apollo has no
+  log capture yet (Roadmap step 9), so the unit's output just inherits
+  apollod's own console instead.
+- A `finish` script (run by `runsv` on exit, for cleanup) — apollo has
+  no equivalent hook; not migrated.
+
+A service with no `run` file, or one that isn't executable, is skipped
+with a reason printed rather than guessed at.
 
 ### Getty
 
