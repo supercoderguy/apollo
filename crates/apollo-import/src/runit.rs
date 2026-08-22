@@ -82,6 +82,19 @@ pub fn convert(
         .with_context(|| format!("reading entries of {}", src.display()))?;
     entries.sort_by_key(|e| e.file_name());
 
+    // Computed up front, by name only (not whether each one actually gets
+    // imported — a `down` file or a missing `run` script could still drop
+    // it) — see the `coldplug_afters` parameter on `convert_one` for why
+    // every *other* unit needs to know these names before any of them are
+    // written, regardless of where alphabetical sorting puts the udev
+    // daemon itself relative to them.
+    let coldplug_afters: Vec<String> = entries
+        .iter()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| looks_like_udev_daemon(n))
+        .map(|n| format!("{n}-coldplug"))
+        .collect();
+
     for entry in entries {
         let path = entry.path();
         if !path.is_dir() {
@@ -96,8 +109,26 @@ pub fn convert(
         };
         let name = name.to_string();
 
-        if let Some(reason) = convert_one(&path, &name, dest, force, include_down, &mut summary)?
+        // The udev daemon itself must not wait on its own coldplug (that's
+        // already `after = [udevd]` the other way around, in
+        // `write_coldplug_unit` — this would be a cycle) — and there's
+        // nothing to add anyway if no udev daemon was found at all.
+        let extra_after: &[String] = if coldplug_afters.is_empty() || looks_like_udev_daemon(&name)
         {
+            &[]
+        } else {
+            &coldplug_afters
+        };
+
+        if let Some(reason) = convert_one(
+            &path,
+            &name,
+            dest,
+            force,
+            include_down,
+            extra_after,
+            &mut summary,
+        )? {
             summary.skipped.push((name, reason));
         } else {
             summary.imported.push(name);
@@ -179,12 +210,24 @@ fn write_coldplug_unit(udev_name: &str, dest: &Path, force: bool) -> Result<Opti
 
 /// Returns `Ok(Some(reason))` if this service was skipped, `Ok(None)` if
 /// it was imported (having already pushed any notes onto `summary`).
+///
+/// `extra_after` is the `<udev_name>-coldplug` unit name(s) (see
+/// `convert`) this unit should be ordered after, if any were found in this
+/// import — real-world finding: a service that scans for network
+/// interfaces once at startup (e.g. `dhcpcd`) and gives up if none exist
+/// yet doesn't reliably notice one appearing later, even with its own udev
+/// hotplug monitor active, if it started before coldplug ran. Since
+/// there's no general way to tell which imported services care about
+/// hardware being present and which don't, every unit gets this ordering
+/// whenever a udev daemon was found in the same import — a unit that
+/// doesn't care just starts ~1s later than it otherwise would.
 fn convert_one(
     path: &Path,
     name: &str,
     dest: &Path,
     force: bool,
     include_down: bool,
+    extra_after: &[String],
     summary: &mut Summary,
 ) -> Result<Option<String>> {
     let run_path = path.join("run");
@@ -243,9 +286,10 @@ fn convert_one(
     }
     if path.join("log").is_dir() {
         note_bits.push(
-            "had a 'log/' service — runit piped its output there; apollo has no log \
-             capture yet (see README roadmap), so this unit's output now just inherits \
-             apollod's own console instead"
+            "had a 'log/' service — runit piped its output there (typically through \
+             svlogd, for rotation); apollo has no equivalent log-service concept, so \
+             this isn't migrated. The main service's own output is still captured, \
+             just via apollod's own /var/log/apollo/<name>.log instead"
                 .to_string(),
         );
     }
@@ -255,6 +299,16 @@ fn convert_one(
              equivalent hook, it was not migrated"
                 .to_string(),
         );
+    }
+    if !extra_after.is_empty() {
+        note_bits.push(format!(
+            "ordered after {} — a udev daemon was part of this import, and a service \
+             that only scans for network/hardware interfaces once at startup won't \
+             reliably notice one appearing later (found on a real boot: dhcpcd started \
+             before coldplug created its interface, logged 'no interfaces have a \
+             carrier', and never tried again)",
+            extra_after.join(", ")
+        ));
     }
     for n in &note_bits {
         summary.notes.push((name.to_string(), n.clone()));
@@ -289,6 +343,10 @@ fn convert_one(
         "working-dir = {}\n",
         toml_string(&dir_abs.display().to_string())
     ));
+    if !extra_after.is_empty() {
+        let items: Vec<String> = extra_after.iter().map(|s| toml_string(s)).collect();
+        toml.push_str(&format!("after = [{}]\n", items.join(", ")));
+    }
 
     fs::write(&dest_file, toml).with_context(|| format!("writing {}", dest_file.display()))?;
 

@@ -237,6 +237,23 @@ Same `sleep 1` caveat as `examples/network/udev-trigger.toml` (see
 Network, above): apollod has no readiness/notify protocol, so this is a
 blunt fix for a real race, not a design choice.
 
+**Every *other* imported unit is also ordered `after` that coldplug unit**
+whenever one was generated — not just units that obviously need hardware.
+Found on a real boot, one step further than the coldplug fix above: even
+with the interface itself finally coldplugged into existence, `dhcpcd`
+still came up without an IP, because it had no ordering relationship with
+coldplug at all and had already run its one-time interface scan and given
+up (`no valid interfaces found`, `no interfaces have a carrier`) before
+`enp0s3` existed — and, despite loading its own udev hotplug monitor
+(`dev: loaded udev` in its log), never noticed the interface appear
+afterward either. There's no general way for this tool to know which
+imported services care about hardware being present and which don't, so
+every unit pays the same ~1s ordering cost rather than guessing. This
+only affects newly generated unit files — like the `--clean` fix above,
+a machine already running units from an older import needs to actually
+re-run `apollo-import runit ... --clean --force` (then restart the
+affected units, or reboot) before this ordering takes effect there.
+
 Two more things about a source service have no apollo equivalent (yet)
 and just get a warning printed plus a `# NOTE:` comment in the generated
 file, rather than being silently dropped:
