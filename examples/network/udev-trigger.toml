@@ -1,0 +1,17 @@
+# One-shot coldplug: devices that already existed before udevd started
+# (everything, on a normal boot) never generated a uevent udevd could see,
+# so nothing gets rules applied to it without this — `udevadm trigger`
+# replays synthetic "add" events for everything already present, and
+# `udevadm settle` waits for udevd to finish processing its event queue.
+#
+# The `sleep 1` is a real wart, not a style choice: apollod has no
+# readiness/notify protocol (unlike systemd, which holds this unit back
+# via udevd's own `Type=notify` until udevd signals it's actually
+# listening) — `after` here only orders *start*, not readiness. Without
+# some delay, `udevadm trigger` can race udevd's netlink socket setup and
+# silently lose events. A fixed sleep is a blunt fix; a real fix is
+# tracked as a possible future roadmap item (see README).
+name = "udev-trigger"
+exec = ["/bin/sh", "-c", "sleep 1 && udevadm trigger --action=add && udevadm settle"]
+restart = "no"
+after = ["udevd"]

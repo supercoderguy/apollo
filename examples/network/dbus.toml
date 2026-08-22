@@ -1,0 +1,12 @@
+# The system D-Bus daemon — NetworkManager (and most other userspace
+# daemons that aren't pure appliance-style processes) talk over it, both
+# to each other and to CLI tools like `nmcli`.
+#
+# `mkdir -p /run/dbus` is needed by hand here: normally that directory is
+# created by systemd-tmpfiles from a package-shipped tmpfiles.d config,
+# but apollo doesn't run systemd-tmpfiles (not in scope — see README) so
+# nothing else creates it. `--nofork` keeps it in the foreground, same
+# reasoning as udevd.toml.
+name = "dbus"
+exec = ["/bin/sh", "-c", "mkdir -p /run/dbus && exec /usr/bin/dbus-daemon --system --nofork --nopidfile"]
+restart = "always"

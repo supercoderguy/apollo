@@ -1,0 +1,16 @@
+# Device manager: listens on the kernel's netlink uevent socket and
+# applies udev rules (device permissions, /dev/disk/by-* symlinks,
+# network interface naming, ...) as devices are added. devtmpfs alone
+# (mounts.rs) gives raw device nodes but none of that.
+#
+# Runs in the foreground, same as the getty units — no `--daemon`/fork-
+# and-exit flag, since apollod only ever tracks the single pid it spawned
+# (see Roadmap step 6); a self-daemonizing process would escape tracking
+# entirely as soon as it forked and its parent exited.
+#
+# Binary path varies by distro: this is Fedora's (part of the systemd
+# package). Void/other non-systemd distros typically ship eudev instead —
+# adjust to e.g. /usr/lib/eudev/udevd there.
+name = "udevd"
+exec = ["/usr/lib/systemd/systemd-udevd"]
+restart = "always"

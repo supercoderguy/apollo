@@ -1,0 +1,12 @@
+# Brings up actual network connectivity (DHCP on wired by default, given
+# a saved/autoconnect connection profile — see README for the caveat on
+# this). Needs the system bus (`dbus`) to register on and to be reachable
+# on; needs `udev-trigger` to have already run so its devices (interface
+# names, in particular) are known before it starts probing.
+#
+# Same `mkdir -p` + foreground reasoning as dbus.toml: /run/NetworkManager
+# would otherwise be created by tmpfiles, which apollo doesn't run.
+name = "networkmanager"
+exec = ["/bin/sh", "-c", "mkdir -p /run/NetworkManager && exec /usr/sbin/NetworkManager --no-daemon"]
+restart = "always"
+after = ["dbus", "udev-trigger"]

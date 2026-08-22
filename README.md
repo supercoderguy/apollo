@@ -33,6 +33,7 @@ crates/
   apolloctl/      the CLI control client
 examples/services/ toy unit files for local dev testing (no root needed)
 examples/getty/    real getty units meant for an actual /etc/apollo/services
+examples/network/  real udev/dbus/NetworkManager units, ditto
 ```
 
 ### Architecture
@@ -144,6 +145,54 @@ physical console a getty is attached to, apollod's own output can
 interleave with the login prompt. Cosmetic, not a functional problem —
 but it goes away once step 9 gives units (and probably apollod's own
 diagnostics) somewhere else to write.
+
+### Network
+
+`examples/network/` has four units, meant to actually be deployed
+together (copy into `/etc/apollo/services/`): `udevd`, `udev-trigger`,
+`dbus`, `networkmanager`. Start order (from `after`, resolved the same
+way as any other unit's dependencies): `udevd` and `dbus` first (no
+dependencies between them), then `udev-trigger` (`after = ["udevd"]`),
+then `networkmanager` last (`after = ["dbus", "udev-trigger"]`).
+
+No new apollod code was needed for any of this — same as getty, it's all
+just unit files exercising the existing `exec`/`restart`/`after`
+mechanism. A few real wrinkles worth knowing before deploying these,
+though:
+
+- **Binary paths are distro-specific.** `udevd.toml` points at Fedora's
+  `systemd-udevd` (`/usr/lib/systemd/systemd-udevd`); a non-systemd
+  distro (Void, in particular) typically ships `eudev` instead, at a
+  different path — adjust before use.
+- **No `systemd-tmpfiles`.** `/run/dbus` and `/run/NetworkManager`
+  normally get created by it from package-shipped configs; apollo
+  doesn't run it (not in scope), so `dbus.toml` and
+  `networkmanager.toml` each `mkdir -p` their own directory by hand in
+  the unit's `exec` before launching the real binary.
+- **No readiness protocol.** `after` only orders *start*, not readiness
+  — apollod has no equivalent of systemd's `sd_notify`/`Type=notify`, so
+  the next unit in an `after` chain starts as soon as the previous one is
+  spawned, not once it's actually listening/ready. `udev-trigger.toml`
+  papers over this against `udevd` with a flat `sleep 1` before
+  triggering, which is a real wart, not a design choice — it can race on
+  a slow enough boot. `dbus`/`networkmanager` haven't shown the same
+  issue in review, but haven't been verified on a real boot either. A
+  proper readiness protocol would remove the need for this but is a
+  bigger feature, not planned for now.
+- **Autoconnect isn't guaranteed out of the box.** Whether
+  NetworkManager actually brings an interface up via DHCP with no
+  further configuration depends on its own defaults/config
+  (`/etc/NetworkManager/NetworkManager.conf`, `no-auto-default`) and
+  whatever connection profiles already exist under
+  `/etc/NetworkManager/system-connections/` — that's NetworkManager's
+  own behavior, not something apollo controls.
+
+Not safe to test by just running apollod as an ordinary dev/test process
+on a real machine, unlike the toy units in `examples/services/` — these
+touch real system paths (`/run/dbus`, the real system D-Bus socket) and
+would fight with (or disrupt networking on) whatever's already running
+there. Verification is real-boot-only, same as the early mounts (step 3)
+were before the Void Linux boot confirmed them.
 
 ### Shutdown
 
@@ -318,14 +367,15 @@ VM) to a usable login prompt and shutting it down cleanly.
    whole process group (`kill(-pgid, ...)`) instead of just the one pid.
    A cgroup-per-unit approach (kill via `cgroup.kill`) is the more robust
    long-term fix and falls out naturally once cgroup2 is mounted (step 3).
-7. **udev.** devtmpfs alone gives raw device nodes but not permissions,
-   persistent `/dev/disk/by-uuid` symlinks, or hotplug handling. Start
-   `systemd-udevd` as a unit (it runs fine under a non-systemd PID 1) and
-   run `udevadm trigger --action=add && udevadm settle` for the initial
-   coldplug.
-8. **D-Bus + NetworkManager**, for a networked (SSH-reachable) VM:
-   units for `dbus-broker` (or `dbus-daemon`) and `NetworkManager`,
-   `after = ["dbus"]`.
+7. ~~udev~~ (implemented as unit files, unverified against a real boot) —
+   see [Network](#network) below. No new apollod code: `systemd-udevd`
+   runs fine as an ordinary foreground unit under a non-systemd PID 1
+   (same as the getty units), and coldplug is a second one-shot unit
+   (`udevadm trigger --action=add && udevadm settle`) ordered `after` it.
+8. ~~D-Bus + NetworkManager~~ (implemented as unit files, unverified
+   against a real boot) — see [Network](#network) below. Also no new
+   apollod code — `dbus-daemon --nofork` and `NetworkManager --no-daemon`
+   as units, `networkmanager` ordered `after = ["dbus", "udev-trigger"]`.
 9. **Log capture.** Redirect each unit's stdout/stderr to
    `/var/log/apollo/<name>.log` instead of inheriting apollod's own —
    needed for debugging boot issues on a console you can't scroll back.
@@ -376,8 +426,11 @@ Steps, for the Fedora VM:
    interleaved, that's cosmetic. Log in, and from that shell,
    `apolloctl list`/`status` should work against the real default socket
    (`/run/apollo/control.sock`) with no `--socket` override needed.
-   **No networking will be up** (no dbus/NetworkManager units yet — step
-   8), so this is console-only; SSH won't reach it.
+   **No networking will be up** on this first boot — deliberately, per
+   step 3 above, to keep this first boot's variables down to just
+   apollod/getty — so it's console-only; SSH won't reach it. Once this
+   boots cleanly, `examples/network/` (see [Network](#network)) can be
+   added on a subsequent boot to bring connectivity up too.
 6. **Shut down**: `apolloctl poweroff` (or `reboot`, or `halt`) from that
    shell. A `reboot` is safe to try without complication — the GRUB edit
    from step 4 was one-time, so the *next* boot goes back to systemd
