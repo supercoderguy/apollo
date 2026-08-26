@@ -596,6 +596,39 @@ Steps, for the Fedora VM:
    from step 4 was one-time, so the *next* boot goes back to systemd
    automatically, not back into apollo.
 
+### Installing for real
+
+Once the GRUB-edit testing above has been done and apollo boots the
+machine cleanly, `install.sh` (repo root) does the *permanent* version
+of the same thing: builds `apollod`/`apolloctl`/`apollo-import`, copies
+them to `/apollo`, symlinks `/sbin/init` → `/apollo/apollod`, imports the
+machine's current services, and reboots into it. Unlike the GRUB edit,
+this is not one-shot — every future boot goes through apollo until
+something changes `/sbin/init` back.
+
+Run it as root, on the machine it's installing onto (same "build on the
+VM itself" reasoning as step 1 above — a binary built elsewhere isn't
+guaranteed to run here). It only knows how to import from runit right
+now (same as `apollo-import` itself — see above), and refuses to run
+against anything else by checking PID 1 directly rather than guessing
+from installed packages.
+
+Before touching `/sbin/init` it backs up whatever's there now —
+recording the original symlink target, or copying the file if it isn't
+a symlink — to `/apollo/rollback/`, along with a small `rollback.sh` to
+put it back by hand (from a live USB with the real root mounted, or from
+a rescue shell) if a later boot doesn't come up. That covers undoing the
+`/sbin/init` swap itself; it's not a substitute for having already
+proven the boot works via the GRUB edit first, since `install.sh` has no
+way to know in advance whether *this* machine's specific services will
+come up cleanly under apollo.
+
+Flags: `-y`/`--yes` skips the confirmation prompts (before touching
+`/sbin/init`, and before the final reboot), `--skip-build` uses whatever
+is already in `target/release` instead of running `cargo build
+--release`, and `--no-reboot` stops after importing services instead of
+rebooting.
+
 ## Tested On
 | Distro     | Tester             | Status                       |
 |------------|--------------------|------------------------------|
