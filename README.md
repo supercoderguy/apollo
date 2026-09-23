@@ -630,10 +630,10 @@ is already in `target/release` instead of running `cargo build
 rebooting.
 
 ## Tested On
-| Distro     | Tester             | Status                       |
-|------------|--------------------|------------------------------|
-| Void Linux | Linux User Lucario | Network devices not working  |
-| Fedora     | Linux User Lucario | Does not boot                |
+| Distro     | Tester             | Status            |
+|------------|--------------------|-------------------|
+| Void Linux | Linux User Lucario | Works perfectly!  |
+| Fedora     | Linux User Lucario | Does not boot     |
 
 ## License
 
